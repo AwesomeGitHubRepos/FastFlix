@@ -1,0 +1,93 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import logging
+import shlex
+
+import reusables
+
+from fastflix.encoders.common.hdr_metadata import is_hdr_bit_depth
+from fastflix.encoders.common.helpers import Command, generate_all, generate_color_details
+from fastflix.models.encode import SVTAVIFSettings
+from fastflix.models.fastflix import FastFlix
+
+logger = logging.getLogger("fastflix")
+
+
+@reusables.log_exception("fastflix", show_traceback=True)
+def build(fastflix: FastFlix):
+    settings: SVTAVIFSettings = fastflix.current_video.video_settings.video_encoder_settings
+    beginning, ending, output_fps = generate_all(fastflix, "libsvtav1", audio=False)
+
+    beginning.extend(["-preset", str(settings.speed)])
+    beginning.extend(generate_color_details(fastflix))
+
+    svtav1_params = settings.svtav1_params.copy()
+
+    if settings.tune != "1":
+        svtav1_params.append(f"tune={settings.tune}")
+    if settings.sharpness != "0":
+        svtav1_params.append(f"sharpness={settings.sharpness}")
+
+    if not fastflix.current_video.video_settings.remove_hdr:
+        if (
+            fastflix.current_video.video_settings.color_primaries == "bt2020"
+            or fastflix.current_video.color_primaries == "bt2020"
+        ):
+            svtav1_params.append("color-primaries=9")
+
+        if (
+            fastflix.current_video.video_settings.color_transfer == "smpte2084"
+            or fastflix.current_video.color_transfer == "smpte2084"
+        ):
+            svtav1_params.append("transfer-characteristics=16")
+
+        if (
+            fastflix.current_video.video_settings.color_space
+            and "bt2020" in fastflix.current_video.video_settings.color_space
+        ) or (fastflix.current_video.color_space and "bt2020" in fastflix.current_video.color_space):
+            svtav1_params.append("matrix-coefficients=9")
+
+        enable_hdr = False
+        if is_hdr_bit_depth(settings.pix_fmt):
+
+            def convert_me(two_numbers, conversion_rate=50_000) -> str:
+                try:
+                    num_one, num_two = map(float, two_numbers.strip("()").split(","))
+                    return f"{num_one / conversion_rate:0.4f},{num_two / conversion_rate:0.4f}"
+                except ValueError:
+                    return two_numbers.strip("()")
+
+            if fastflix.current_video.master_display:
+                svtav1_params.append(
+                    "mastering-display="
+                    f"G({convert_me(fastflix.current_video.master_display.green)})"
+                    f"B({convert_me(fastflix.current_video.master_display.blue)})"
+                    f"R({convert_me(fastflix.current_video.master_display.red)})"
+                    f"WP({convert_me(fastflix.current_video.master_display.white)})"
+                    f"L({convert_me(fastflix.current_video.master_display.luminance, 10_000)})"
+                )
+                enable_hdr = True
+
+            if fastflix.current_video.cll:
+                svtav1_params.append(f"content-light={fastflix.current_video.cll}")
+                enable_hdr = True
+
+            if enable_hdr:
+                svtav1_params.append("enable-hdr=1")
+
+    if svtav1_params:
+        beginning.extend(["-svtav1-params", ":".join(svtav1_params)])
+
+    pass_type = "bitrate" if settings.bitrate else "QP"
+
+    extra = shlex.split(settings.extra) if settings.extra else []
+
+    if settings.bitrate:
+        command_1 = beginning + ["-b:v", settings.bitrate] + extra + ["-f", "avif"] + ending
+
+    elif settings.qp is not None:
+        command_1 = beginning + [f"-{settings.qp_mode}", str(settings.qp)] + extra + ["-f", "avif"] + ending
+    else:
+        return []
+    return [Command(command=command_1, name=f"{pass_type}", exe="ffmpeg")]

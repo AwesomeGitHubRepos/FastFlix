@@ -1,0 +1,728 @@
+# -*- coding: utf-8 -*-
+
+import html
+import logging
+
+from box import Box
+from iso639 import iter_langs
+from PySide6 import QtCore, QtWidgets
+
+from fastflix.exceptions import FastFlixError
+from fastflix.flix import ffmpeg_valid_color_primaries, ffmpeg_valid_color_transfers, ffmpeg_valid_color_space
+from fastflix.language import t, Language
+from fastflix.widgets.panels.abstract_list import FlixList
+from fastflix.models.fastflix_app import FastFlixApp
+from fastflix.models.encode import x265Settings, setting_types
+from fastflix.models.profiles import AudioMatch, Profile, MatchItem, MatchType, TitleMode, AdvancedOptions
+from fastflix.shared import error_message
+from fastflix.widgets.toggle_switch import ToggleSwitch
+from fastflix.encoders.common.audio import channel_list
+
+language_list = [v.name for v in iter_langs() if v.pt2b and v.pt1] + ["Undefined"]
+
+logger = logging.getLogger("fastflix")
+
+match_type_eng = [MatchType.ALL, MatchType.FIRST, MatchType.LAST]
+match_type_locale = [t("All"), t("First"), t("Last")]
+
+match_item_enums = [
+    MatchItem.ALL,
+    MatchItem.TITLE,
+    MatchItem.TRACK,
+    MatchItem.LANGUAGE,
+    MatchItem.CHANNELS,
+    MatchItem.CODEC,
+    MatchItem.CODEC_PROFILE,
+]
+match_item_locale = [
+    t("All"),
+    t("Title"),
+    t("Track Number"),
+    t("Language"),
+    t("Channels"),
+    t("Codec"),
+    t("Codec & Profile"),
+]
+
+sub_match_item_enums = [MatchItem.ALL, MatchItem.TRACK, MatchItem.LANGUAGE]
+sub_match_item_locale = [t("All"), t("Track Number"), t("Language")]
+
+title_mode_enums = [TitleMode.ORIGINAL, TitleMode.NO_TITLE, TitleMode.GENERATE, TitleMode.CUSTOM]
+title_mode_locale = [t("Original Title"), t("No Title"), t("Generate Title"), t("Custom Title")]
+
+
+class AudioProfile(QtWidgets.QTabWidget):
+    def __init__(self, parent_list, app, main, parent, index):
+        super(AudioProfile, self).__init__(parent)
+        self.enabled = True
+        self.index = index
+        self.parent = parent
+        self.parent_list = parent_list
+        self.match_type = QtWidgets.QComboBox()
+        self.match_type.addItems(match_type_locale)
+
+        self.match_type.view().setFixedWidth(self.match_type.minimumSizeHint().width() + 50)
+        self.setFixedHeight(150)
+
+        self.match_item = QtWidgets.QComboBox()
+        self.match_item.addItems(match_item_locale)
+
+        self.match_item.view().setFixedWidth(self.match_item.minimumSizeHint().width() + 50)
+
+        self.match_input_boxes = [
+            QtWidgets.QLineEdit("*"),
+            QtWidgets.QLineEdit(""),
+            QtWidgets.QComboBox(),
+            QtWidgets.QComboBox(),
+            QtWidgets.QComboBox(),
+            QtWidgets.QLineEdit(""),
+            QtWidgets.QLineEdit(""),
+        ]
+        self.match_input = self.match_input_boxes[0]
+        self.match_input_boxes[0].setDisabled(True)
+        self.match_input_boxes[1].setPlaceholderText(t("contains"))
+        self.match_input_boxes[2].addItems([str(x) for x in range(1, 24)])
+        self.match_input_boxes[3].addItems(language_list)
+        self.match_input_boxes[3].setCurrentText("English")
+        self.match_input_boxes[4].addItems(
+            ["none | unknown", "mono", "stereo", "3 | 2.1", "4", "5", "6 | 5.1", "7", "8 | 7.1", "9", "10"]
+        )
+        self.match_input_boxes[5].setPlaceholderText(t("e.g. dts, truehd, aac"))
+        self.match_input_boxes[6].setPlaceholderText(t("e.g. dts:DTS-HD MA"))
+
+        self.match_input_boxes[2].view().setFixedWidth(self.match_input_boxes[2].minimumSizeHint().width() + 50)
+        self.match_input_boxes[3].view().setFixedWidth(self.match_input_boxes[3].minimumSizeHint().width() + 50)
+        self.match_input_boxes[4].view().setFixedWidth(self.match_input_boxes[4].minimumSizeHint().width() + 50)
+
+        self.kill_myself = QtWidgets.QPushButton("X")
+
+        # First Row
+        self.grid = QtWidgets.QGridLayout()
+        self.grid.addWidget(QtWidgets.QLabel(t("Match")), 0, 0)
+        self.grid.addWidget(self.match_type, 0, 1)
+        self.grid.addWidget(QtWidgets.QLabel(t("Select By")), 0, 2)
+        self.grid.addWidget(self.match_item, 0, 3)
+        self.grid.addWidget(self.match_input, 0, 4)
+        self.grid.addWidget(self.kill_myself, 0, 5, 1, 5)
+
+        self.downmix = QtWidgets.QComboBox()
+        self.downmix.addItems([t("No Downmix")] + list(channel_list.keys()))
+        self.downmix.setCurrentIndex(0)
+        self.downmix.view().setFixedWidth(self.downmix.minimumSizeHint().width() + 50)
+
+        self.title_mode = QtWidgets.QComboBox()
+        self.title_mode.addItems(title_mode_locale)
+        self.title_mode.setCurrentIndex(0)
+        self.title_mode.view().setFixedWidth(self.title_mode.minimumSizeHint().width() + 50)
+
+        self.custom_title = QtWidgets.QLineEdit()
+        self.custom_title.setPlaceholderText(t("Enter custom title"))
+        self.custom_title.setDisabled(True)
+        self.custom_title.setFixedWidth(150)
+
+        self.convert_to = QtWidgets.QComboBox()
+        self.convert_to.addItems(["None | Passthrough"] + main.video_options.audio_formats)
+
+        self.convert_to.view().setFixedWidth(self.convert_to.minimumSizeHint().width() + 50)
+        self.bitrate = QtWidgets.QLineEdit()
+        self.bitrate.setPlaceholderText("128k")
+        self.bitrate.setFixedWidth(self.bitrate.minimumSizeHint().width() + 50)
+
+        self.bitrate.setDisabled(True)
+        self.downmix.setDisabled(True)
+
+        # Values passed to FFmpeg -profile:a (HE profiles are only supported by libfdk_aac)
+        self.aac_profile_values = [None, "aac_he", "aac_he_v2"]
+        self.aac_profile = QtWidgets.QComboBox()
+        self.aac_profile.addItems(
+            [
+                t("AAC-LC (default)"),
+                f"HE-AAC ({t('libfdk_aac only')})",
+                f"HE-AAC v2 ({t('libfdk_aac only')})",
+            ]
+        )
+        self.aac_profile.setToolTip(t("HE-AAC profiles require the libfdk_aac encoder"))
+        self.aac_profile.setDisabled(True)
+
+        self.grid.addWidget(QtWidgets.QLabel(t("Conversion")), 1, 0)
+        self.grid.addWidget(self.convert_to, 1, 1)
+        self.grid.addWidget(QtWidgets.QLabel(t("Bitrate")), 1, 2)
+        self.grid.addWidget(self.bitrate, 1, 3)
+        self.grid.addWidget(self.downmix, 1, 4)
+        self.grid.addWidget(self.aac_profile, 1, 5)
+
+        self.grid.addWidget(QtWidgets.QLabel(t("Title")), 2, 0)
+        self.grid.addWidget(self.title_mode, 2, 1)
+        self.grid.addWidget(self.custom_title, 2, 2, 1, 2)
+        self.grid.setColumnStretch(3, 0)
+        self.grid.setColumnStretch(4, 0)
+        self.grid.setColumnStretch(5, 0)
+
+        self.setLayout(self.grid)
+
+        self.kill_myself.clicked.connect(lambda: self.parent_list.remove_track(self.index))
+        self.convert_to.currentIndexChanged.connect(self.update_conversion)
+        self.match_item.currentIndexChanged.connect(self.update_combos)
+        self.match_type.currentIndexChanged.connect(self.update_combos)
+        self.match_type.currentIndexChanged.connect(self.update_title_mode_availability)
+        self.title_mode.currentIndexChanged.connect(self.update_custom_title_field)
+
+        # Initial state: disable Custom Title option since default is Match All
+        self.update_title_mode_availability()
+
+    def update_combos(self):
+        self.match_input.hide()
+        self.match_input = self.match_input_boxes[self.match_item.currentIndex()]
+
+        self.grid.addWidget(self.match_input, 0, 4)
+        self.match_input.show()
+
+    def update_conversion(self):
+        if self.convert_to.currentIndex() == 0:
+            self.bitrate.setDisabled(True)
+            self.downmix.setDisabled(True)
+        else:
+            self.bitrate.setEnabled(True)
+            self.downmix.setEnabled(True)
+        if self.convert_to.currentIndex() > 0 and "aac" in self.convert_to.currentText().lower():
+            self.aac_profile.setEnabled(True)
+        else:
+            self.aac_profile.setDisabled(True)
+            self.aac_profile.setCurrentIndex(0)
+
+    def update_title_mode_availability(self):
+        """Add/remove the Custom Title option based on match type."""
+        match_type = match_type_eng[self.match_type.currentIndex()]
+        custom_title_text = title_mode_locale[title_mode_enums.index(TitleMode.CUSTOM)]
+        has_custom_option = self.title_mode.findText(custom_title_text) != -1
+
+        if match_type == MatchType.ALL:
+            # Remove Custom Title option when Match All is selected
+            if has_custom_option:
+                custom_index = self.title_mode.findText(custom_title_text)
+                # If Custom Title was selected, switch to Original Title first
+                if self.title_mode.currentIndex() == custom_index:
+                    self.title_mode.setCurrentIndex(0)
+                    self.custom_title.setDisabled(True)
+                self.title_mode.removeItem(custom_index)
+        else:
+            # Add Custom Title option for First or Last
+            if not has_custom_option:
+                self.title_mode.addItem(custom_title_text)
+
+    def update_custom_title_field(self):
+        """Enable/disable the custom title text field based on title mode selection."""
+        current_text = self.title_mode.currentText()
+        custom_title_text = title_mode_locale[title_mode_enums.index(TitleMode.CUSTOM)]
+        if current_text == custom_title_text:
+            self.custom_title.setEnabled(True)
+        else:
+            self.custom_title.setDisabled(True)
+
+    def set_outdex(self, pos):
+        pass
+
+    def set_first(self, pos):
+        pass
+
+    def set_last(self, pos):
+        pass
+
+    def get_settings(self):
+        match_item_enum = match_item_enums[self.match_item.currentIndex()]
+        if match_item_enum in (MatchItem.ALL, MatchItem.TITLE):
+            match_input_value = self.match_input.text()
+        elif match_item_enum == MatchItem.TRACK:
+            match_input_value = self.match_input.currentText()
+        elif match_item_enum == MatchItem.LANGUAGE:
+            match_input_value = Language(self.match_input.currentText()).pt2b
+        elif match_item_enum == MatchItem.CHANNELS:
+            match_input_value = str(self.match_input.currentIndex())
+        elif match_item_enum in (MatchItem.CODEC, MatchItem.CODEC_PROFILE):
+            match_input_value = self.match_input.text().strip()
+        else:
+            raise Exception("Internal error, what do we do sir?")
+
+        if self.convert_to.currentIndex() > 0 and not self.bitrate.text().strip():
+            raise FastFlixError("No Bitrate")
+
+        # Get title mode by matching the current text to the locale list
+        current_title_mode_text = self.title_mode.currentText()
+        title_mode_index = title_mode_locale.index(current_title_mode_text)
+        selected_title_mode = title_mode_enums[title_mode_index]
+
+        return AudioMatch(
+            match_type=match_type_eng[self.match_type.currentIndex()],
+            match_item=match_item_enum,
+            match_input=match_input_value,
+            conversion=self.convert_to.currentText() if self.convert_to.currentIndex() > 0 else None,
+            conversion_profile=self.aac_profile_values[self.aac_profile.currentIndex()]
+            if self.aac_profile.isEnabled()
+            else None,
+            bitrate=self.bitrate.text(),
+            downmix=self.downmix.currentText() if self.downmix.currentIndex() > 0 else None,
+            title_mode=selected_title_mode,
+            custom_title=self.custom_title.text() if selected_title_mode == TitleMode.CUSTOM else None,
+        )
+
+
+class AudioSelect(FlixList):
+    def __init__(self, app, parent, main):
+        super().__init__(app, parent, "Audio Select", "Audio")
+        self.tracks = []
+        self.main = main
+
+        self.audio_select_type = QtWidgets.QButtonGroup()
+
+        self.passthrough_name = t("Passthrough All")
+        self.disable_audio_name = t("Don't Select Any Audio")
+        self.patter_match_name = t("Pattern Match")
+
+        self.passthrough_checkbox = QtWidgets.QRadioButton(self.passthrough_name)
+        self.disable_audio_checkbox = QtWidgets.QRadioButton(self.disable_audio_name)
+        self.patter_match_checkbox = QtWidgets.QRadioButton(self.patter_match_name)
+
+        self.audio_select_type.addButton(self.passthrough_checkbox)
+        self.audio_select_type.addButton(self.disable_audio_checkbox)
+        self.audio_select_type.addButton(self.patter_match_checkbox)
+        self.audio_select_type.buttonClicked.connect(self.set_audio_mode)
+
+        self.add_button = QtWidgets.QPushButton(f"  {t('Add Pattern Match')}  ")
+        if self.app.fastflix.config.theme == "onyx":
+            self.add_button.setStyleSheet("border-radius: 10px;")
+
+        # self.passthrough_checkbox.toggled.connect(self.passthrough_check)
+        # self.disable_audio_checkbox.toggled.connect(self.disable_audio_check)
+
+        self.add_button.clicked.connect(self.add_track)
+
+        button_layout = QtWidgets.QVBoxLayout()
+        button_layout.addWidget(self.passthrough_checkbox)
+        button_layout.addWidget(self.disable_audio_checkbox)
+        button_layout.addWidget(self.patter_match_checkbox)
+
+        top_layout = QtWidgets.QHBoxLayout()
+        top_layout.addLayout(button_layout)
+        top_layout.addWidget(self.add_button)
+
+        layout = self.layout()
+        # self.scroll_area = super().scroll_area
+        layout.removeWidget(self.scroll_area)
+        layout.addLayout(top_layout)
+
+        layout.addWidget(self.scroll_area)
+
+        self.hardware_warning = QtWidgets.QLabel(t("Rigaya's encoders will only match one encoding per track"))
+        self.hardware_warning.hide()
+
+        layout.addWidget(self.hardware_warning)
+        self.passthrough_checkbox.setChecked(True)
+        self.scroll_area.setDisabled(True)
+        self.add_button.setDisabled(True)
+
+        super()._new_source(self.tracks)
+
+    def update_settings(self):
+        if getattr(self.main.current_encoder, "original_audio_tracks_only", False):
+            self.hardware_warning.show()
+        else:
+            self.hardware_warning.hide()
+
+    def add_track(self):
+        new_track = AudioProfile(self, self.app, self.main, self.inner_widget, len(self.tracks))
+        self.tracks.append(new_track)
+        self.reorder(height=156)
+
+    def remove_track(self, index):
+        self.tracks.pop(index).close()
+        for i, track in enumerate(self.tracks):
+            track.index = i
+        self.reorder(height=156)
+
+    def set_audio_mode(self, button):
+        if button.text() == self.passthrough_name:
+            # self.passthrough_checkbox.setChecked(True)
+            # self.disable_audio_checkbox.setChecked(False)
+            # self.patter_match_checkbox.setChecked(False)
+            self.scroll_area.setDisabled(True)
+            self.add_button.setDisabled(True)
+        elif button.text() == self.disable_audio_name:
+            # self.passthrough_checkbox.setChecked(False)
+            # self.disable_audio_checkbox.setChecked(True)
+            # self.patter_match_checkbox.setChecked(False)
+            self.scroll_area.setDisabled(True)
+            self.add_button.setDisabled(True)
+        elif button.text() == self.patter_match_name:
+            # self.passthrough_checkbox.setChecked(False)
+            # self.disable_audio_checkbox.setChecked(False)
+            # self.patter_match_checkbox.setChecked(True)
+            self.scroll_area.setEnabled(True)
+            self.add_button.setEnabled(True)
+
+    def get_settings(self):
+        if self.passthrough_checkbox.isChecked():
+            return None
+        if self.disable_audio_checkbox.isChecked():
+            return False
+        filters = []
+        for track in self.tracks:
+            filters.append(track.get_settings())
+        return filters
+
+
+class SubtitleSelect(QtWidgets.QWidget):
+    def __init__(self, app, parent):
+        super().__init__()
+
+        self.app = app
+        self.parent = parent
+
+        sub_language_label = QtWidgets.QLabel(t("Subtitle select language"))
+        self.sub_language = QtWidgets.QComboBox()
+        self.sub_language.addItems([t("All"), t("None")] + language_list)
+        self.sub_language.insertSeparator(1)
+        self.sub_language.insertSeparator(3)
+        self.sub_language.setFixedWidth(250)
+        self.sub_first_only = ToggleSwitch(t("Only select first matching Subtitle Track"))
+        self.sub_language.view().setFixedWidth(self.sub_language.minimumSizeHint().width() + 50)
+
+        self.sub_burn_in = ToggleSwitch(t("Auto Burn-in first forced or default subtitle track"))
+
+        disposition_options = [t("Keep Source"), t("Clear All"), t("Set on First Track")]
+
+        default_disp_label = QtWidgets.QLabel(t("Default flag"))
+        self.default_disposition = QtWidgets.QComboBox()
+        self.default_disposition.addItems(disposition_options)
+        self.default_disposition.setFixedWidth(250)
+
+        forced_disp_label = QtWidgets.QLabel(t("Forced flag"))
+        self.forced_disposition = QtWidgets.QComboBox()
+        self.forced_disposition.addItems(disposition_options)
+        self.forced_disposition.setFixedWidth(250)
+
+        layout = QtWidgets.QGridLayout()
+        layout.addWidget(sub_language_label, 0, 0)
+        layout.addWidget(self.sub_language, 0, 1)
+        layout.addWidget(self.sub_first_only, 1, 0)
+        layout.addWidget(self.sub_burn_in, 2, 0, 1, 2)
+        layout.addWidget(default_disp_label, 3, 0)
+        layout.addWidget(self.default_disposition, 3, 1)
+        layout.addWidget(forced_disp_label, 4, 0)
+        layout.addWidget(self.forced_disposition, 4, 1)
+        layout.addWidget(QtWidgets.QWidget(), 5, 0, 1, 2)
+        layout.setRowStretch(5, True)
+        self.setLayout(layout)
+
+    def get_default_disposition(self) -> str | None:
+        idx = self.default_disposition.currentIndex()
+        return [None, "clear", "first"][idx]
+
+    def get_forced_disposition(self) -> str | None:
+        idx = self.forced_disposition.currentIndex()
+        return [None, "clear", "first"][idx]
+
+
+class DataSelect(QtWidgets.QWidget):
+    def __init__(self, app, parent):
+        super().__init__()
+
+        self.app = app
+        self.parent = parent
+
+        self.data_select_type = QtWidgets.QButtonGroup()
+
+        self.passthrough_name = t("Passthrough All")
+        self.remove_all_name = t("Remove All")
+
+        self.passthrough_checkbox = QtWidgets.QRadioButton(self.passthrough_name)
+        self.remove_all_checkbox = QtWidgets.QRadioButton(self.remove_all_name)
+
+        self.data_select_type.addButton(self.passthrough_checkbox)
+        self.data_select_type.addButton(self.remove_all_checkbox)
+
+        self.passthrough_checkbox.setChecked(True)
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(self.passthrough_checkbox)
+        layout.addWidget(self.remove_all_checkbox)
+        layout.addStretch(1)
+        self.setLayout(layout)
+
+    def get_settings(self):
+        """Return None for passthrough all, False for remove all."""
+        if self.remove_all_checkbox.isChecked():
+            return False
+        return None
+
+
+class AdvancedTab(QtWidgets.QTabWidget):
+    def __init__(self, advanced_settings):
+        super().__init__()
+
+        layout = QtWidgets.QVBoxLayout()
+        self.label = QtWidgets.QLabel()
+
+        self.color_primaries_widget = QtWidgets.QComboBox()
+        self.color_primaries_widget.addItem(t("Unspecified"))
+        self.color_primaries_widget.addItems(ffmpeg_valid_color_primaries)
+
+        self.color_transfer_widget = QtWidgets.QComboBox()
+        self.color_transfer_widget.addItem(t("Unspecified"))
+        self.color_transfer_widget.addItems(ffmpeg_valid_color_transfers)
+
+        self.color_space_widget = QtWidgets.QComboBox()
+        self.color_space_widget.addItem(t("Unspecified"))
+        self.color_space_widget.addItems(ffmpeg_valid_color_space)
+
+        primaries_layout = QtWidgets.QHBoxLayout()
+        primaries_layout.addWidget(QtWidgets.QLabel(t("Color Primaries")))
+        primaries_layout.addWidget(self.color_primaries_widget)
+
+        transfer_layout = QtWidgets.QHBoxLayout()
+        transfer_layout.addWidget(QtWidgets.QLabel(t("Color Transfer")))
+        transfer_layout.addWidget(self.color_transfer_widget)
+
+        space_layout = QtWidgets.QHBoxLayout()
+        space_layout.addWidget(QtWidgets.QLabel(t("Color Space")))
+        space_layout.addWidget(self.color_space_widget)
+
+        layout.addLayout(primaries_layout)
+        layout.addLayout(transfer_layout)
+        layout.addLayout(space_layout)
+        layout.addStretch(1)
+        layout.addWidget(self.label)
+        layout.addStretch(1)
+        self.text_update(advanced_settings)
+        self.setLayout(layout)
+
+    def text_update(self, advanced_settings):
+        ignored = ("color_primaries", "color_transfer", "color_space", "denoise_type_index", "denoise_strength_index")
+        settings = "\n".join(f"{k:<30} {v}" for k, v in advanced_settings.model_dump().items() if k not in ignored)
+        self.label.setText(f"<pre>{html.escape(settings)}</pre>")
+
+
+class PrimaryOptions(QtWidgets.QTabWidget):
+    def __init__(self, main_options):
+        super().__init__()
+
+        layout = QtWidgets.QVBoxLayout()
+        self.label = QtWidgets.QLabel()
+        settings = "\n".join(f"{k:<30} {v}" for k, v in main_options.items())
+        self.label.setText(f"<pre>{html.escape(settings)}</pre>")
+
+        self.auto_crop = ToggleSwitch(t("Auto Crop"))
+
+        layout.addWidget(self.auto_crop)
+        layout.addStretch(1)
+        layout.addWidget(self.label)
+        layout.addStretch(1)
+        self.setLayout(layout)
+
+
+class EncoderOptions(QtWidgets.QTabWidget):
+    def __init__(self, app, main):
+        super().__init__()
+        self.main = main
+        self.app = app
+        self.label = QtWidgets.QLabel()
+
+        layout = QtWidgets.QVBoxLayout()
+
+        layout.addWidget(self.label)
+        layout.addStretch(1)
+
+        self.update_settings()
+
+        self.setLayout(layout)
+
+    def update_settings(self):
+        settings = "\n".join(f"{k:<30} {v}" for k, v in self.main.encoder.model_dump().items())
+        self.label.setText(f"<pre>{html.escape(settings)}</pre>")
+
+
+class ProfileWindow(QtWidgets.QWidget):
+    def __init__(self, app: FastFlixApp, main, container, *args, **kwargs):
+        super().__init__(None, *args, **kwargs)
+        self.app = app
+        self.main = main
+        self.container = container
+        self.config_file = self.app.fastflix.config.config_path
+        self.setWindowTitle(t("New Profile"))
+        self.setMinimumSize(500, 600)
+        layout = QtWidgets.QGridLayout()
+
+        profile_name_label = QtWidgets.QLabel(t("Profile Name"))
+        profile_name_label.setFixedHeight(40)
+        self.profile_name = QtWidgets.QLineEdit()
+        if self.app.fastflix.config.theme == "onyx":
+            self.profile_name.setStyleSheet("background-color: #4a555e; border-radius: 10px; color: black")
+        self.profile_name.setFixedWidth(300)
+
+        self.advanced_options: AdvancedOptions = self.main.video_options.advanced.get_settings()
+
+        self.encoder = x265Settings(crf=18)
+
+        theme = "QPushButton{ padding: 0 10px; }"
+        if self.app.fastflix.config.theme in ("dark", "onyx"):
+            theme = """
+            QPushButton {
+              padding: 0 10px;
+              background-color: #4f4f4f;
+              border: none;
+              border-radius: 10px;
+              color: white; }
+            QPushButton:hover {
+              background-color: #6b6b6b; }"""
+
+        save_button = QtWidgets.QPushButton(t("Create Profile"))
+        save_button.setStyleSheet(theme)
+        save_button.clicked.connect(self.save)
+        save_button.setMaximumWidth(150)
+        save_button.setFixedHeight(60)
+        v_flip, h_flip = self.main.get_flips()
+        self.main_settings = Box(
+            fast_seek=self.main.fast_time,
+            rotate=self.main.widgets.rotate.currentIndex(),
+            vertical_flip=v_flip,
+            horizontal_flip=h_flip,
+            copy_chapters=self.main.copy_chapters,
+            remove_metadata=self.main.remove_metadata,
+            remove_hdr=self.main.remove_hdr,
+            resolution_method=self.main.resolution_method(),
+            resolution_custom=self.main.resolution_custom(),
+            output_type=self.main.output_type_for_profile(),
+        )
+
+        self.tab_area = QtWidgets.QTabWidget()
+        self.tab_area.setMinimumWidth(500)
+        self.audio_select = AudioSelect(self.app, self, self.main)
+        self.subtitle_select = SubtitleSelect(self.app, self)
+        self.data_select = DataSelect(self.app, self)
+        self.advanced_tab = AdvancedTab(self.advanced_options)
+        self.primary_tab = PrimaryOptions(self.main_settings)
+        self.encoder_tab = EncoderOptions(self.app, self)
+        self.tab_area.addTab(self.primary_tab, t("Primary Settings"))
+        self.tab_area.addTab(self.encoder_tab, t("Video"))
+        self.tab_area.addTab(self.audio_select, t("Audio"))
+        self.tab_area.addTab(self.subtitle_select, t("Subtitles"))
+        self.tab_area.addTab(self.data_select, t("Data"))
+        self.tab_area.addTab(self.advanced_tab, t("Advanced Options"))
+        # self.tab_area.addTab(self.subtitle_select, "Subtitles")
+        # self.tab_area.addTab(SubtitleSelect(self.app, self, "Subtitle Select", "subtitles"), "Subtitle Select")
+
+        layout.addWidget(profile_name_label, 0, 0)
+        layout.addWidget(self.profile_name, 0, 1, 1, 2, alignment=QtCore.Qt.AlignCenter)
+        # layout.addWidget(self.auto_crop, 1, 0)
+        # layout.addWidget(audio_language_label, 2, 0)
+        # layout.addWidget(self.audio_language, 2, 1)
+        # layout.addWidget(self.audio_first_only, 3, 1)
+        # layout.addWidget(self.encoder_label, 7, 0, 1, 2)
+        # layout.addWidget(self.encoder_settings, 8, 0, 10, 2)
+        layout.addWidget(save_button, 0, 5, alignment=QtCore.Qt.AlignRight)
+
+        layout.addWidget(self.tab_area, 1, 0, 20, 6)
+
+        layout.setColumnStretch(0, 0)
+        layout.setColumnStretch(1, 0)
+        layout.setColumnStretch(2, 1)
+        self.update_settings()
+
+        self.setLayout(layout)
+
+    def update_settings(self):
+        try:
+            encoder = self.app.fastflix.current_video.video_settings.video_encoder_settings
+        except AttributeError:
+            pass
+        else:
+            if encoder:
+                self.encoder = encoder
+        self.encoder_tab.update_settings()
+        self.audio_select.update_settings()
+        self.advanced_options = self.main.video_options.advanced.get_settings()
+        self.advanced_tab.text_update(self.advanced_options)
+
+    def save(self):
+        profile_name = self.profile_name.text().strip()
+        if not profile_name:
+            return error_message(t("Please provide a profile name"))
+        if profile_name in self.app.fastflix.config.profiles:
+            return error_message(f"{t('Profile')} {self.profile_name.text().strip()} {t('already exists')}")
+
+        sub_lang = "en"
+        subtitle_enabled = True
+        subtitle_select_preferred_language = False
+        if self.subtitle_select.sub_language.currentIndex() == 2:  # None
+            subtitle_select_preferred_language = False
+            subtitle_enabled = False
+        elif self.subtitle_select.sub_language.currentIndex() != 0:
+            subtitle_select_preferred_language = True
+            sub_lang = Language(self.subtitle_select.sub_language.currentText()).pt2b
+
+        self.advanced_options.color_space = (
+            None
+            if self.advanced_tab.color_space_widget.currentIndex() == 0
+            else self.advanced_tab.color_space_widget.currentText()
+        )
+        self.advanced_options.color_transfer = (
+            None
+            if self.advanced_tab.color_transfer_widget.currentIndex() == 0
+            else self.advanced_tab.color_transfer_widget.currentText()
+        )
+        self.advanced_options.color_primaries = (
+            None
+            if self.advanced_tab.color_primaries_widget.currentIndex() == 0
+            else self.advanced_tab.color_primaries_widget.currentText()
+        )
+
+        try:
+            audio_settings = self.audio_select.get_settings()
+        except FastFlixError:
+            return error_message(t("Please provide bitrates for the audio streams"))
+
+        new_profile = Profile(
+            profile_version=2,
+            auto_crop=self.primary_tab.auto_crop.isChecked(),
+            fast_seek=self.main_settings.fast_seek,
+            rotate=self.main_settings.rotate,
+            vertical_flip=self.main_settings.vertical_flip,
+            horizontal_flip=self.main_settings.horizontal_flip,
+            copy_chapters=self.main_settings.copy_chapters,
+            remove_metadata=self.main_settings.remove_metadata,
+            remove_hdr=self.main_settings.remove_hdr,
+            audio_filters=audio_settings,
+            data_passthrough=self.data_select.get_settings(),
+            resolution_method=self.main_settings.resolution_method,
+            resolution_custom=self.main_settings.resolution_custom,
+            output_type=self.main.output_type_for_profile(),
+            # subtitle_filters=self.subtitle_select.get_settings(),
+            subtitle_language=sub_lang,
+            subtitle_select=subtitle_enabled,
+            subtitle_automatic_burn_in=self.subtitle_select.sub_burn_in.isChecked(),
+            subtitle_select_preferred_language=subtitle_select_preferred_language,
+            subtitle_select_first_matching=self.subtitle_select.sub_first_only.isChecked(),
+            subtitle_default_disposition=self.subtitle_select.get_default_disposition(),
+            subtitle_forced_disposition=self.subtitle_select.get_forced_disposition(),
+            encoder=self.encoder.name,
+            advanced_options=self.advanced_options,
+        )
+
+        for snake_name, encoder_settings in setting_types.items():
+            if encoder_settings().name == self.encoder.name:
+                setattr(new_profile, snake_name, self.encoder)
+                break
+        else:
+            logger.error(f"Profile cannot be saved! Unknown encoder type {self.encoder.__class__.__name__}.")
+            return
+
+        self.app.fastflix.config.profiles[profile_name] = new_profile
+        self.app.fastflix.config.selected_profile = profile_name
+        self.app.fastflix.config.save()
+        self.main.widgets.profile_box.addItem(profile_name)
+        self.main.widgets.profile_box.setCurrentText(profile_name)
+        self.container.profile_window = None
+        self.close()
+
+    def close(self):
+        self.container.profile_window = None
+        return super().close()

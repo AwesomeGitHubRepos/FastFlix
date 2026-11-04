@@ -1,0 +1,179 @@
+# -*- coding: utf-8 -*-
+import logging
+
+from fastflix.encoders.common.helpers import Command
+from fastflix.models.encode import VCEEncCAV1Settings
+from fastflix.models.video import Video
+from fastflix.models.fastflix import FastFlix
+from fastflix.encoders.common.encc_helpers import (
+    build_subtitle,
+    build_audio,
+    build_data,
+    rigaya_auto_options,
+    rigaya_avformat_reader,
+    rigaya_trim_or_seek,
+    rigaya_extra_options,
+    split_extra_args,
+    rigaya_hdr_static_metadata,
+    pa_builder,
+    qvbr_quality_value,
+)
+
+logger = logging.getLogger("fastflix")
+
+
+def build(fastflix: FastFlix):
+    video: Video = fastflix.current_video
+    settings: VCEEncCAV1Settings = fastflix.current_video.video_settings.video_encoder_settings
+
+    try:
+        stream_id = int(video.current_video_stream["id"], 16)
+    except Exception:
+        if len(video.streams.video) > 1:
+            logger.warning("Could not get stream ID from source, the proper video track may not be selected!")
+        stream_id = None
+
+    vsync_setting = "cfr" if video.frame_rate == video.average_frame_rate else "vfr"
+    if video.video_settings.vsync == "cfr":
+        vsync_setting = "forcecfr"
+    elif video.video_settings.vsync == "vfr":
+        vsync_setting = "vfr"
+
+    output_depth = settings.output_depth
+    if not settings.output_depth:
+        output_depth = (
+            "10"
+            if fastflix.current_video.current_video_stream.bit_depth > 8
+            and not fastflix.current_video.video_settings.remove_hdr
+            else "8"
+        )
+
+    command = [
+        str(fastflix.config.vceencc),
+    ]
+    command.extend(rigaya_avformat_reader(fastflix))
+    command.extend(["--device", str(settings.device)])
+    command.extend(["-i", str(video.source)])
+
+    if stream_id is not None:
+        command.extend(["--video-streamid", str(stream_id)])
+    command.extend(rigaya_trim_or_seek(video))
+    if video.video_settings.source_fps:
+        command.extend(["--fps", str(video.video_settings.source_fps)])
+    if video.video_settings.rotate:
+        command.extend(["--vpp-rotate", str(video.video_settings.rotate * 90)])
+    if video.video_settings.vertical_flip or video.video_settings.horizontal_flip:
+        flip_x = "true" if video.video_settings.horizontal_flip else "false"
+        flip_y = "true" if video.video_settings.vertical_flip else "false"
+        command.extend(["--vpp-transform", f"flip_x={flip_x},flip_y={flip_y}"])
+    if video.video_settings.crop:
+        crop = video.video_settings.crop
+        command.extend(["--crop", f"{crop.left},{crop.top},{crop.right},{crop.bottom}"])
+    if video.output_width is not None and video.output_height is not None:
+        command.extend(["--output-res", f"{video.output_width}x{video.output_height}"])
+
+    if video.video_settings.remove_metadata:
+        command.extend(["--video-metadata", "clear", "--metadata", "clear"])
+    elif video.video_settings.remove_hdr:
+        command.extend(["--video-metadata", "clear", "--metadata", "copy"])
+    else:
+        command.extend(["--video-metadata", "copy", "--metadata", "copy"])
+
+    if video.video_settings.video_title:
+        command.extend(["--metadata", f"title={video.video_settings.video_title}"])
+    if video.video_settings.copy_chapters:
+        command.append("--chapter-copy")
+
+    command.extend(["-c", "av1"])
+
+    qvbr = qvbr_quality_value(settings)
+    if not qvbr and settings.bitrate_mode == "qvbr":
+        qvbr = "23"
+    if qvbr:
+        command.extend(["--qvbr", qvbr])
+    elif settings.bitrate:
+        command.extend([f"--{settings.bitrate_mode}", settings.bitrate.rstrip("k")])
+    else:
+        command.extend(["--cqp", str(settings.cqp)])
+
+    if video.video_settings.maxrate:
+        command.extend(["--max-bitrate", str(video.video_settings.maxrate)])
+        if video.video_settings.bufsize:
+            command.extend(["--vbv-bufsize", str(video.video_settings.bufsize)])
+    if settings.min_q and (settings.bitrate or qvbr):
+        command.extend(["--qp-min", str(settings.min_q)])
+    if settings.max_q and (settings.bitrate or qvbr):
+        command.extend(["--qp-max", str(settings.max_q)])
+    if settings.b_frames:
+        command.extend(["--bframes", str(settings.b_frames)])
+    if settings.ref:
+        command.extend(["--ref", str(settings.ref)])
+
+    command.extend(["--preset", settings.preset])
+    command.extend(["--level", settings.level or "auto"])
+
+    command.extend(rigaya_auto_options(fastflix))
+
+    command.extend(rigaya_hdr_static_metadata(fastflix))
+    if settings.copy_hdr10 and not video.video_settings.remove_hdr:
+        command.extend(["--dhdr10-info", "copy"])
+    if settings.copy_dv and not video.video_settings.remove_hdr:
+        command.extend(["--dolby-vision-rpu", "copy"])
+        command.extend(["--dolby-vision-profile", "copy"])
+        if video.video_settings.crop:
+            command.extend(["--dolby-vision-rpu-prm", "crop=true"])
+
+    command.extend(["--output-depth", output_depth])
+    if settings.pre_encode:
+        command.append("--pe")
+
+    pa = pa_builder(settings)
+    if pa:
+        command.extend(pa)
+
+    command.extend(["--avsync", vsync_setting])
+
+    if video.interlaced and video.interlaced != "False":
+        command.extend(["--interlace", video.interlaced])
+    if video.video_settings.deinterlace:
+        command.append("--vpp-nnedi")
+    hdr2sdr_param = None
+    if video.video_settings.remove_hdr:
+        remove_type = (
+            video.video_settings.tone_map
+            if video.video_settings.tone_map in ("mobius", "hable", "reinhard")
+            else "mobius"
+        )
+        hdr2sdr_param = f"hdr2sdr={remove_type}"
+
+    command.extend(rigaya_extra_options(video, hdr2sdr=hdr2sdr_param))
+
+    if settings.split_mode == "parallel":
+        command.extend(["--parallel", "auto"])
+    if settings.metrics:
+        command.extend(["--psnr", "--ssim"])
+
+    command.extend(build_audio(video.audio_tracks, video.streams.audio))
+    command.extend(
+        build_subtitle(
+            video.subtitle_tracks,
+            video.streams.subtitle,
+            video_height=video.height,
+            remove_metadata=video.video_settings.remove_metadata,
+        )
+    )
+    command.extend(
+        build_data(
+            video.data_tracks,
+            getattr(video.streams, "data", []),
+            getattr(video.streams, "attachment", []),
+            video.video_settings.output_path,
+        )
+    )
+
+    if settings.extra:
+        command.extend(split_extra_args(settings.extra))
+
+    command.extend(["-o", str(video.video_settings.output_path)])
+
+    return [Command(command=command, name="VCEEncC Encode", exe="VCEEncC")]

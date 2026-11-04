@@ -2,18 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import logging
-import re
 from pathlib import Path
-from typing import List, Tuple, Union
+from typing import Tuple, Union
 
 from box import Box
-from qtpy import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastflix.language import t
 from fastflix.models.encode import AttachmentTrack
 from fastflix.models.fastflix_app import FastFlixApp
-from fastflix.models.video import VideoSettings
 from fastflix.shared import link
+from fastflix.widgets.toggle_switch import ToggleSwitch
 
 logger = logging.getLogger("fastflix")
 
@@ -35,21 +34,25 @@ class CoverPanel(QtWidgets.QWidget):
         layout.addWidget(QtWidgets.QLabel(t("Poster Cover")), 0, 0, 1, 5)
         layout.addWidget(QtWidgets.QLabel(t("Landscape Cover")), 0, 6, 1, 4)
         info_label = QtWidgets.QLabel(
-            link("https://codecalamity.com/guides/video-thumbnails/", t("Enabling cover thumbnails on your system"))
+            link(
+                "https://codecalamity.com/guides/video-thumbnails/",
+                t("Enabling cover thumbnails on your system"),
+                app.fastflix.config.theme,
+            )
         )
         info_label.setOpenExternalLinks(True)
         layout.addWidget(info_label, 10, 0, 1, 9, QtCore.Qt.AlignLeft)
 
         poster_options_layout = QtWidgets.QHBoxLayout()
-        self.cover_passthrough_checkbox = QtWidgets.QCheckBox(t("Copy Cover"))
-        self.small_cover_passthrough_checkbox = QtWidgets.QCheckBox(t("Copy Small Cover (no preview)"))
+        self.cover_passthrough_checkbox = ToggleSwitch(t("Copy Cover"))
+        self.small_cover_passthrough_checkbox = ToggleSwitch(t("Copy Small Cover (no preview)"))
 
         poster_options_layout.addWidget(self.cover_passthrough_checkbox)
         poster_options_layout.addWidget(self.small_cover_passthrough_checkbox)
 
         land_options_layout = QtWidgets.QHBoxLayout()
-        self.cover_land_passthrough_checkbox = QtWidgets.QCheckBox(t("Copy Landscape Cover"))
-        self.small_cover_land_passthrough_checkbox = QtWidgets.QCheckBox(t("Copy Small Landscape Cover  (no preview)"))
+        self.cover_land_passthrough_checkbox = ToggleSwitch(t("Copy Landscape Cover"))
+        self.small_cover_land_passthrough_checkbox = ToggleSwitch(t("Copy Small Landscape Cover  (no preview)"))
 
         land_options_layout.addWidget(self.cover_land_passthrough_checkbox)
         land_options_layout.addWidget(self.small_cover_land_passthrough_checkbox)
@@ -75,6 +78,12 @@ class CoverPanel(QtWidgets.QWidget):
         layout.addLayout(self.init_landscape_cover(), 9, 6, 1, 4)
         layout.columnStretch(5)
 
+        self._extracting_label = QtWidgets.QLabel(t("Extracting cover images..."))
+        self._extracting_label.setAlignment(QtCore.Qt.AlignCenter)
+        self._extracting_label.setStyleSheet("font-style: italic; color: gray;")
+        layout.addWidget(self._extracting_label, 5, 0, 1, 10, QtCore.Qt.AlignCenter)
+        self._extracting_label.hide()
+
         self.setLayout(layout)
 
     def init_cover(self):
@@ -97,7 +106,7 @@ class CoverPanel(QtWidgets.QWidget):
         filename = QtWidgets.QFileDialog.getOpenFileName(
             self,
             caption=t("Cover"),
-            directory=str(dirname),
+            dir=str(dirname),
             filter=f"{t('Supported Image Files')} (*.png *.jpeg *.jpg)",
         )
         if not filename or not filename[0]:
@@ -152,7 +161,7 @@ class CoverPanel(QtWidgets.QWidget):
         filename = QtWidgets.QFileDialog.getOpenFileName(
             self,
             caption=t("Landscape Cover"),
-            directory=str(dirname),
+            dir=str(dirname),
             filter=f"{t('Supported Image Files')} (*.png *.jpeg *.jpg)",
         )
         if not filename or not filename[0]:
@@ -206,12 +215,30 @@ class CoverPanel(QtWidgets.QWidget):
     def update_cover_settings(self):
         if not self.app.fastflix.current_video:
             return
-        start_outdex = (
-            1  # Video Track
-            + len(self.app.fastflix.current_video.video_settings.audio_tracks)
-            + len(self.app.fastflix.current_video.video_settings.subtitle_tracks)
-        )
-        attachments: List[AttachmentTrack] = []
+        # start_outdex = (
+        # 1  # Video Track
+        # + len(self.app.fastflix.current_video.audio_tracks)
+        # + len(self.app.fastflix.current_video.subtitle_tracks)
+        # )
+        start_outdex = 1
+
+        for audio_track in self.app.fastflix.current_video.audio_tracks:
+            if audio_track.enabled:
+                audio_track.outdex = start_outdex
+                start_outdex += 1
+
+        for subtitle_track in self.app.fastflix.current_video.subtitle_tracks:
+            if subtitle_track.enabled:
+                subtitle_track.outdex = start_outdex
+                start_outdex += 1
+
+        # Data/attachment tracks use -map and occupy output stream slots
+        # before -attach streams (FFmpeg places -map before -attach in output)
+        for data_track in getattr(self.app.fastflix.current_video, "data_tracks", []) or []:
+            if data_track.enabled:
+                start_outdex += 1
+
+        attachments: list[AttachmentTrack] = []
 
         for filename in ("cover", "cover_land", "small_cover", "small_cover_land"):
             attachment, index = self.get_attachment(filename)
@@ -220,13 +247,13 @@ class CoverPanel(QtWidgets.QWidget):
                     AttachmentTrack(
                         index=index,
                         outdex=start_outdex,
-                        file_path=attachment,
+                        file_path=str(attachment),
                         filename=filename,
                         attachment_type="cover",
                     )
                 )
                 start_outdex += 1
-        self.app.fastflix.current_video.video_settings.attachment_tracks = attachments
+        self.app.fastflix.current_video.attachment_tracks = attachments
 
     def cover_passthrough_check(self):
         checked = self.cover_passthrough_checkbox.isChecked()
@@ -310,55 +337,88 @@ class CoverPanel(QtWidgets.QWidget):
             )
 
     def new_source(self, attachments):
-
         self.clear_covers(reconnect=False)
 
         for attachment in attachments:
             filename = attachment.get("tags", {}).get("filename", "")
             base_name = filename.rsplit(".", 1)[0]
-            file_path = self.app.fastflix.current_video.work_path / filename
-            if base_name == "cover" and file_path.exists():
-                self.cover_passthrough_checkbox.setChecked(True)
-                self.cover_passthrough_checkbox.setDisabled(False)
-                self.update_cover(str(file_path))
-                self.cover_path.setDisabled(True)
-                self.cover_path.setText("")
-                self.cover_button.setDisabled(True)
+            if base_name == "cover":
                 self.attachments.cover = {"name": filename, "stream": attachment.index, "tags": attachment.tags}
-            if base_name == "cover_land" and file_path.exists():
-                self.cover_land_passthrough_checkbox.setChecked(True)
-                self.cover_land_passthrough_checkbox.setDisabled(False)
-                self.update_landscape_cover(str(file_path))
-                self.cover_land_path.setDisabled(True)
-                self.cover_land_path.setText("")
-                self.landscape_button.setDisabled(True)
+                self.cover_passthrough_checkbox.setDisabled(False)
+            if base_name == "cover_land":
                 self.attachments.cover_land = {"name": filename, "stream": attachment.index, "tags": attachment.tags}
-            if base_name == "small_cover" and file_path.exists():
-                self.small_cover_passthrough_checkbox.setChecked(True)
-                self.small_cover_passthrough_checkbox.setDisabled(False)
+                self.cover_land_passthrough_checkbox.setDisabled(False)
+            if base_name == "small_cover":
                 self.attachments.small_cover = {"name": filename, "stream": attachment.index, "tags": attachment.tags}
-            if base_name == "small_cover_land" and file_path.exists():
-                self.small_cover_land_passthrough_checkbox.setChecked(True)
-                self.small_cover_land_passthrough_checkbox.setDisabled(False)
+                self.small_cover_passthrough_checkbox.setDisabled(False)
+            if base_name == "small_cover_land":
                 self.attachments.small_cover_land = {
                     "name": filename,
                     "stream": attachment.index,
                     "tags": attachment.tags,
                 }
+                self.small_cover_land_passthrough_checkbox.setDisabled(False)
 
         self.cover_passthrough_checkbox.toggled.connect(lambda: self.cover_passthrough_check())
         self.small_cover_passthrough_checkbox.toggled.connect(lambda: self.small_cover_passthrough_check())
         self.cover_land_passthrough_checkbox.toggled.connect(lambda: self.cover_land_passthrough_check())
         self.small_cover_land_passthrough_checkbox.toggled.connect(lambda: self.small_cover_land_passthrough_check())
 
-    def reload_from_queue(self, streams, settings: VideoSettings):
+    def set_extracting(self, extracting: bool):
+        """Show or hide the loading indicator while covers are being extracted."""
+        if extracting:
+            self._extracting_label.show()
+        else:
+            self._extracting_label.hide()
+
+    def covers_extracted(self):
+        """Called after background extraction completes. Updates previews for extracted cover files."""
+        self.set_extracting(False)
+        if not self.app.fastflix.current_video:
+            return
+
+        work_path = self.app.fastflix.current_video.work_path
+
+        if "cover" in self.attachments:
+            file_path = work_path / self.attachments.cover.name
+            if file_path.exists():
+                if not self.cover_passthrough_checkbox.isChecked():
+                    self.cover_passthrough_checkbox.setChecked(True)
+                    self.cover_path.setDisabled(True)
+                    self.cover_path.setText("")
+                    self.cover_button.setDisabled(True)
+                self.update_cover(str(file_path))
+
+        if "cover_land" in self.attachments:
+            file_path = work_path / self.attachments.cover_land.name
+            if file_path.exists():
+                if not self.cover_land_passthrough_checkbox.isChecked():
+                    self.cover_land_passthrough_checkbox.setChecked(True)
+                    self.cover_land_path.setDisabled(True)
+                    self.cover_land_path.setText("")
+                    self.landscape_button.setDisabled(True)
+                self.update_landscape_cover(str(file_path))
+
+        if "small_cover" in self.attachments:
+            file_path = work_path / self.attachments.small_cover.name
+            if file_path.exists():
+                if not self.small_cover_passthrough_checkbox.isChecked():
+                    self.small_cover_passthrough_checkbox.setChecked(True)
+
+        if "small_cover_land" in self.attachments:
+            file_path = work_path / self.attachments.small_cover_land.name
+            if file_path.exists():
+                if not self.small_cover_land_passthrough_checkbox.isChecked():
+                    self.small_cover_land_passthrough_checkbox.setChecked(True)
+
+    def reload_from_queue(self, streams, attachment_tracks):
         self.new_source(streams.attachment)
         self.cover_passthrough_checkbox.setChecked(False)
         self.cover_land_passthrough_checkbox.setChecked(False)
         self.small_cover_land_passthrough_checkbox.setChecked(False)
         self.small_cover_passthrough_checkbox.setChecked(False)
 
-        for attachment in settings.attachment_tracks:
+        for attachment in attachment_tracks:
             if attachment.filename == "cover":
                 if attachment.index is None:
                     self.cover_path.setText(str(attachment.file_path))
@@ -382,10 +442,10 @@ class CoverPanel(QtWidgets.QWidget):
 #     def update_cover_settings(self):
 #         start_outdex = (
 #             1  # Video Track
-#             + len(self.app.fastflix.current_video.video_settings.audio_tracks)
-#             + len(self.app.fastflix.current_video.video_settings.subtitle_tracks)
+#             + len(self.app.fastflix.current_video.audio_tracks)
+#             + len(self.app.fastflix.current_video.subtitle_tracks)
 #         )
-#         attachments: List[AttachmentTrack] = []
+#         attachments: list[AttachmentTrack] = []
 #
 #         for filename in ("cover", "cover_land", "small_cover", "small_cover_land"):
 #             attachment = self.get_attachment(filename)

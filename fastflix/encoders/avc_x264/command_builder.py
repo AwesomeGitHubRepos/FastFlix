@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-import re
 import secrets
+import shlex
 
+from fastflix.encoders.common.hdr_metadata import is_hdr_bit_depth, parse_master_display
 from fastflix.encoders.common.helpers import Command, generate_all, generate_color_details, null
 from fastflix.models.encode import x264Settings
 from fastflix.models.fastflix import FastFlix
@@ -10,31 +11,93 @@ from fastflix.models.fastflix import FastFlix
 def build(fastflix: FastFlix):
     settings: x264Settings = fastflix.current_video.video_settings.video_encoder_settings
 
-    beginning, ending = generate_all(fastflix, "libx264")
+    beginning, ending, output_fps = generate_all(fastflix, "libx264")
 
-    beginning += f'{f"-tune:v {settings.tune}" if settings.tune else ""} {generate_color_details(fastflix)} '
+    if settings.tune:
+        beginning.extend(["-tune:v", settings.tune])
 
-    if settings.profile and settings.profile != "default":
-        beginning += f"-profile:v {settings.profile} "
+    beginning.extend(generate_color_details(fastflix))
+
+    # libx264 refuses lossless (-qp 0) with the baseline/main/high/high10/high422 profiles, only high444 is valid
+    if settings.profile and settings.profile != "default" and (not settings.lossless or settings.profile == "high444"):
+        beginning.extend(["-profile:v", settings.profile])
+
+    if settings.aq_mode and settings.aq_mode != "default":
+        aq_mode_map = {"none": "0", "variance": "1", "autovariance": "2", "autovariance-biased": "3"}
+        beginning.extend(["-aq-mode", aq_mode_map[settings.aq_mode]])
+
+    if settings.psy_rd:
+        beginning.extend(["-psy-rd", settings.psy_rd])
+
+    if settings.level and settings.level != "auto":
+        beginning.extend(["-level", settings.level])
+
+    x264_params = settings.x264_params.copy()
+
+    if not fastflix.current_video.video_settings.remove_hdr and is_hdr_bit_depth(settings.pix_fmt):
+        master_display = parse_master_display(fastflix.current_video.master_display)
+        if master_display:
+            x264_params.append(f"mastering-display={master_display.to_x265()}")
+        if fastflix.current_video.cll:
+            x264_params.append(f"cll={fastflix.current_video.cll}")
+
+    if x264_params:
+        beginning.extend(["-x264-params", ":".join(x264_params)])
 
     pass_log_file = fastflix.current_video.work_path / f"pass_log_file_{secrets.token_hex(10)}"
 
+    extra = shlex.split(settings.extra) if settings.extra else []
+    extra_both = shlex.split(settings.extra) if settings.extra and settings.extra_both_passes else []
+
+    if settings.lossless:
+        # Lossless mode — use QP 0 which is mathematically lossless, no rate control needed
+        command = beginning + ["-qp", "0", "-preset:v", settings.preset] + extra + ending
+        return [Command(command=command, name="Single pass lossless", exe="ffmpeg")]
+
     if settings.bitrate:
-        command_1 = (
-            f"{beginning} -pass 1 "
-            f'-passlogfile "{pass_log_file}" -b:v {settings.bitrate} -preset:v {settings.preset} {settings.extra if settings.extra_both_passes else ""} -an -sn -dn -f mp4 {null}'
-        )
-        command_2 = (
-            f'{beginning} -pass 2 -passlogfile "{pass_log_file}" '
-            f"-b:v {settings.bitrate} -preset:v {settings.preset} {settings.extra} "
-        ) + ending
-        return [
-            Command(command=command_1, name="First pass bitrate", exe="ffmpeg"),
-            Command(command=command_2, name="Second pass bitrate", exe="ffmpeg"),
-        ]
+        if settings.bitrate_passes == 2:
+            command_1 = (
+                beginning
+                + [
+                    "-pass",
+                    "1",
+                    "-passlogfile",
+                    str(pass_log_file),
+                    "-b:v",
+                    settings.bitrate,
+                    "-preset:v",
+                    settings.preset,
+                ]
+                + extra_both
+                + ["-an", "-sn", "-dn"]
+                + output_fps
+                + ["-f", "mp4", null]
+            )
+            command_2 = (
+                beginning
+                + [
+                    "-pass",
+                    "2",
+                    "-passlogfile",
+                    str(pass_log_file),
+                    "-b:v",
+                    settings.bitrate,
+                    "-preset:v",
+                    settings.preset,
+                ]
+                + extra
+                + ending
+            )
+            return [
+                Command(command=command_1, name="First pass bitrate", exe="ffmpeg"),
+                Command(command=command_2, name="Second pass bitrate", exe="ffmpeg"),
+            ]
+        else:
+            command = beginning + ["-b:v", settings.bitrate, "-preset:v", settings.preset] + extra + ending
+            return [Command(command=command, name="Single pass bitrate", exe="ffmpeg")]
 
     elif settings.crf:
-        command = f"{beginning} -crf:v {settings.crf} " f"-preset:v {settings.preset} {settings.extra} {ending}"
+        command = beginning + ["-crf:v", str(settings.crf), "-preset:v", settings.preset] + extra + ending
         return [Command(command=command, name="Single pass CRF", exe="ffmpeg")]
 
     else:

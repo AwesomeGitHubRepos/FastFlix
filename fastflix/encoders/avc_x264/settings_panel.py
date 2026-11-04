@@ -2,7 +2,7 @@
 import logging
 
 from box import Box
-from qtpy import QtCore, QtWidgets
+from PySide6 import QtWidgets
 
 from fastflix.encoders.common.setting_panel import SettingPanel
 from fastflix.language import t
@@ -48,7 +48,14 @@ recommended_crfs = [
     "Custom",
 ]
 
-pix_fmts = ["8-bit: yuv420p", "10-bit: yuv420p10le"]
+pix_fmts = [
+    "8-bit: yuv420p",
+    "10-bit: yuv420p10le",
+    "8-bit 422: yuv422p",
+    "8-bit 444: yuv444p",
+    "10-bit 422: yuv422p10le",
+    "10-bit 444: yuv444p10le",
+]
 
 
 class AVC(SettingPanel):
@@ -67,7 +74,6 @@ class AVC(SettingPanel):
         self.updating_settings = False
 
         grid.addLayout(self.init_modes(), 0, 2, 5, 4)
-        grid.addLayout(self._add_custom(), 10, 0, 1, 6)
 
         grid.addLayout(self.init_preset(), 0, 0, 1, 2)
         grid.addLayout(self.init_max_mux(), 1, 0, 1, 2)
@@ -75,14 +81,25 @@ class AVC(SettingPanel):
         grid.addLayout(self.init_profile(), 3, 0, 1, 2)
         grid.addLayout(self.init_pix_fmt(), 4, 0, 1, 2)
 
+        grid.addLayout(self.init_aq_mode(), 5, 0, 1, 2)
+        grid.addLayout(self.init_psy_rd(), 5, 2, 1, 4)
+        grid.addLayout(self.init_level(), 6, 0, 1, 2)
+        grid.addLayout(self.init_x264_params(), 6, 2, 1, 4)
+        grid.addLayout(self.init_lossless(), 7, 0, 1, 2)
+
         grid.setRowStretch(9, 1)
 
+        custom_layout = self._add_custom()
         guide_label = QtWidgets.QLabel(
-            link("https://trac.ffmpeg.org/wiki/Encode/H.264", t("FFMPEG AVC / H.264 Encoding Guide"))
+            link(
+                "https://trac.ffmpeg.org/wiki/Encode/H.264",
+                t("FFMPEG AVC / H.264 Encoding Guide"),
+                app.fastflix.config.theme,
+            )
         )
-        guide_label.setAlignment(QtCore.Qt.AlignBottom)
         guide_label.setOpenExternalLinks(True)
-        grid.addWidget(guide_label, 11, 0, 1, 6)
+        custom_layout.addWidget(guide_label)
+        grid.addLayout(custom_layout, 10, 0, 1, 6)
 
         self.setLayout(grid)
         self.hide()
@@ -94,7 +111,8 @@ class AVC(SettingPanel):
             options=presets,
             tooltip=(
                 "preset: The slower the preset, the better the compression and quality\n"
-                "Slow is highest personal recommenced, as past that is much smaller gains"
+                "Slow is the slowest preset personally recommended,\n"
+                "presets slower than this result in much smaller gains"
             ),
             connect="default",
             opt="preset",
@@ -138,8 +156,115 @@ class AVC(SettingPanel):
             opt="pix_fmt",
         )
 
+    def init_aq_mode(self):
+        return self._add_combo_box(
+            label="AQ Mode",
+            widget_name="aq_mode",
+            options=["default", "none", "variance", "autovariance", "autovariance-biased"],
+            tooltip=(
+                "aq-mode: Adaptive Quantization operating mode.\n"
+                "0: disabled\n"
+                "1: variance AQ (complexity mask)\n"
+                "2: autovariance AQ\n"
+                "3: autovariance AQ with bias to dark scenes\n"
+                "Default: variance AQ"
+            ),
+            opt="aq_mode",
+        )
+
+    def init_psy_rd(self):
+        return self._add_text_box(
+            label="Psy-RD",
+            widget_name="psy_rd",
+            tooltip=(
+                "psy-rd: Psychovisual rate-distortion optimization strength.\n"
+                "Format: rd:trellis (e.g. 1.0:0.0)\n"
+                "First value is psy-rd strength, second is psy-trellis strength.\n"
+                "Requires subme >= 6 for psy-rd and trellis for psy-trellis."
+            ),
+            opt="psy_rd",
+            placeholder="1.0:0.0",
+        )
+
+    def init_level(self):
+        return self._add_combo_box(
+            label="Level",
+            widget_name="level",
+            options=[
+                "auto",
+                "1",
+                "1.1",
+                "1.2",
+                "1.3",
+                "2",
+                "2.1",
+                "2.2",
+                "3",
+                "3.1",
+                "3.2",
+                "4",
+                "4.1",
+                "4.2",
+                "5",
+                "5.1",
+                "5.2",
+            ],
+            tooltip=(
+                "level: Set the H.264 level restriction.\n"
+                "Limits the maximum bitrate, resolution, and other parameters.\n"
+                "Useful for ensuring compatibility with target devices."
+            ),
+            opt="level",
+        )
+
+    def init_lossless(self):
+        layout = self._add_check_box(
+            label="Lossless",
+            widget_name="lossless",
+            tooltip=(
+                "Enable true lossless coding by bypassing all lossy compression.\n"
+                "Reconstructed output pictures are bit-exact to the input pictures.\n"
+                "All rate control options are ignored in lossless mode.\n"
+                "Slower presets will generally achieve better compression efficiency."
+            ),
+            opt="lossless",
+            connect=lambda: (self._toggle_lossless(), self.main.page_update(build_thumbnail=False)),
+        )
+        return layout
+
+    def _toggle_lossless(self):
+        enabled = not self.widgets.lossless.isChecked()
+        self.qp_radio.setEnabled(enabled)
+        self.bitrate_radio.setEnabled(enabled)
+        self.widgets.crf.setEnabled(enabled)
+        self.widgets.custom_crf.setEnabled(enabled)
+        self.widgets.bitrate.setEnabled(enabled)
+        self.widgets.custom_bitrate.setEnabled(enabled)
+        self.widgets.bitrate_passes.setEnabled(enabled)
+
+    def init_x264_params(self):
+        layout = QtWidgets.QHBoxLayout()
+        self.labels.x264_params = QtWidgets.QLabel(t("Additional x264 params"))
+        self.labels.x264_params.setFixedWidth(200)
+        tool_tip = (
+            f"{t('Extra x264 params in opt=1:opt2=0 format')},\n"
+            f"{t('cannot modify generated settings')}\n"
+            f"{t('examples: rc-lookahead=40:ref=6')}\n"
+        )
+        self.labels.x264_params.setToolTip(tool_tip)
+        layout.addWidget(self.labels.x264_params)
+        self.widgets.x264_params = QtWidgets.QLineEdit()
+        self.widgets.x264_params.setToolTip(tool_tip)
+        self.widgets.x264_params.setText(
+            ":".join(self.app.fastflix.config.encoder_opt(self.profile_name, "x264_params"))
+        )
+        self.opts["x264_params"] = "x264_params"
+        self.widgets.x264_params.textChanged.connect(lambda: self.main.page_update())
+        layout.addWidget(self.widgets.x264_params)
+        return layout
+
     def init_modes(self):
-        return self._add_modes(recommended_bitrates, recommended_crfs, qp_name="crf")
+        return self._add_modes(recommended_bitrates, recommended_crfs, qp_name="crf", show_bitrate_passes=True)
 
     def mode_update(self):
         self.widgets.custom_crf.setDisabled(self.widgets.crf.currentText() != "Custom")
@@ -157,6 +282,8 @@ class AVC(SettingPanel):
 
     def update_video_encoder_settings(self):
         tune = self.widgets.tune.currentText()
+        x264_params_text = self.widgets.x264_params.text().strip()
+        psy_rd_text = self.widgets.psy_rd.text().strip()
 
         settings = x264Settings(
             preset=self.widgets.preset.currentText(),
@@ -166,6 +293,12 @@ class AVC(SettingPanel):
             extra=self.ffmpeg_extras,
             tune=tune if tune.lower() != "default" else None,
             extra_both_passes=self.widgets.extra_both_passes.isChecked(),
+            bitrate_passes=int(self.widgets.bitrate_passes.currentText() or 1),
+            aq_mode=self.widgets.aq_mode.currentText(),
+            psy_rd=psy_rd_text if psy_rd_text else None,
+            level=self.widgets.level.currentText(),
+            x264_params=x264_params_text.split(":") if x264_params_text else [],
+            lossless=self.widgets.lossless.isChecked(),
         )
         encode_type, q_value = self.get_mode_settings()
         settings.crf = q_value if encode_type == "qp" else None

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import logging
 
-from qtpy import QtWidgets
+from PySide6 import QtWidgets
 
 __all__ = ["Logs"]
 
@@ -41,4 +41,4 @@ class Logs(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         self.hide()
-        # event.accept()
+        event.ignore()

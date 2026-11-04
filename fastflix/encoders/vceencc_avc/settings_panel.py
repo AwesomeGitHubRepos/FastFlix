@@ -2,14 +2,13 @@
 import logging
 
 from box import Box
-from qtpy import QtCore, QtWidgets, QtGui
+from PySide6 import QtCore, QtWidgets, QtGui
 
-from fastflix.encoders.common.setting_panel import SettingPanel
+from fastflix.encoders.common.setting_panel import VCEPanel
 from fastflix.language import t
 from fastflix.models.encode import VCEEncCAVCSettings
 from fastflix.models.fastflix_app import FastFlixApp
 from fastflix.shared import link
-from fastflix.resources import warning_icon
 
 logger = logging.getLogger("fastflix")
 
@@ -57,7 +56,7 @@ def get_breaker():
     return breaker_line
 
 
-class VCEENCCAVC(SettingPanel):
+class VCEENCCAVC(VCEPanel):
     profile_name = "vceencc_avc"
     hdr10plus_signal = QtCore.Signal(str)
     hdr10plus_ffmpeg_signal = QtCore.Signal(str)
@@ -75,21 +74,23 @@ class VCEENCCAVC(SettingPanel):
         self.updating_settings = False
 
         grid.addLayout(self.init_modes(), 0, 2, 4, 4)
-        grid.addLayout(self._add_custom(title="Custom VCEEncC options", disable_both_passes=True), 10, 0, 1, 6)
+        custom_layout = self._add_custom(title="Custom VCEEncC options", disable_both_passes=True)
         grid.addLayout(self.init_preset(), 0, 0, 1, 2)
         grid.addLayout(self.init_profile(), 1, 0, 1, 2)
         grid.addLayout(self.init_mv_precision(), 2, 0, 1, 2)
-        grid.addLayout(self.init_pre(), 3, 0, 1, 2)
+        grid.addLayout(self.init_output_depth(), 3, 0, 1, 2)
+        grid.addLayout(self.init_pre(), 4, 0, 1, 2)
+        grid.addLayout(self.init_devices(), 10, 0, 1, 2)
 
         breaker = QtWidgets.QHBoxLayout()
         breaker_label = QtWidgets.QLabel(t("Advanced"))
-        breaker_label.setFont(QtGui.QFont("helvetica", 8, weight=55))
+        breaker_label.setFont(QtGui.QFont(self.app.font().family(), 8, weight=55))
 
         breaker.addWidget(get_breaker(), stretch=1)
         breaker.addWidget(breaker_label, alignment=QtCore.Qt.AlignHCenter)
         breaker.addWidget(get_breaker(), stretch=1)
 
-        grid.addLayout(breaker, 4, 0, 1, 6)
+        grid.addLayout(breaker, 5, 0, 1, 6)
 
         qp_line = QtWidgets.QHBoxLayout()
         qp_line.addLayout(self.init_min_q())
@@ -105,30 +106,35 @@ class VCEENCCAVC(SettingPanel):
         qp_line.addLayout(self.init_decoder())
         qp_line.addStretch(1)
         qp_line.addLayout(self.init_metrics())
-        grid.addLayout(qp_line, 5, 0, 1, 6)
+        qp_line.addStretch(1)
+        qp_line.addLayout(self.init_qvbr_quality())
+        grid.addLayout(qp_line, 6, 0, 1, 6)
 
-        self.ffmpeg_level = QtWidgets.QLabel()
-        grid.addWidget(self.ffmpeg_level, 8, 2, 1, 4)
+        self.init_pa_row()
+        grid.addLayout(self.pa_area, 8, 0, 2, 4)
+        grid.addLayout(self.init_parallel_mode(), 8, 4, 1, 2)
 
-        grid.setRowStretch(9, 1)
+        grid.setRowStretch(11, 1)
 
         guide_label = QtWidgets.QLabel(
-            link("https://github.com/rigaya/VCEEnc/blob/master/VCEEncC_Options.en.md", t("VCEEncC Options"))
+            link(
+                "https://github.com/rigaya/VCEEnc/blob/master/VCEEncC_Options.en.md",
+                t("VCEEncC Options"),
+                app.fastflix.config.theme,
+            )
         )
-
-        warning_label = QtWidgets.QLabel()
-        warning_label.setPixmap(QtGui.QIcon(warning_icon).pixmap(22))
-
-        guide_label.setAlignment(QtCore.Qt.AlignBottom)
         guide_label.setOpenExternalLinks(True)
-        grid.addWidget(guide_label, 11, 0, 1, 4)
-        grid.addWidget(warning_label, 11, 4, 1, 1, alignment=QtCore.Qt.AlignRight)
-        grid.addWidget(QtWidgets.QLabel(t("VCEEncC Encoder support is still experimental!")), 11, 5, 1, 1)
+        custom_layout.addWidget(guide_label)
+        grid.addLayout(custom_layout, 11, 0, 1, 6)
 
         self.setLayout(grid)
         self.hide()
         self.hdr10plus_signal.connect(self.done_hdr10plus_extract)
         self.hdr10plus_ffmpeg_signal.connect(lambda x: self.ffmpeg_level.setText(x))
+
+    def init_devices(self):
+        devices = [f"{k}: {v['name']}" for k, v in self.app.fastflix.config.vceencc_devices.items()]
+        return self._add_combo_box(widget_name="device", label="Device", options=devices, opt="device")
 
     def init_preset(self):
         return self._add_combo_box(
@@ -144,7 +150,7 @@ class VCEENCCAVC(SettingPanel):
         return self._add_combo_box(
             label="Profile",
             widget_name="profile",
-            options=["Baseline", "Main", "High"],
+            options=["Auto", "Baseline", "Main", "High"],
             connect="default",
             opt="profile",
         )
@@ -171,7 +177,11 @@ class VCEENCCAVC(SettingPanel):
         layout = QtWidgets.QHBoxLayout()
         layout.addLayout(self._add_check_box(label="VBAQ", widget_name="vbaq", opt="vbaq"))
         layout.addLayout(self._add_check_box(label="Pre Encode", widget_name="pre_encode", opt="pre_encode"))
-        layout.addLayout(self._add_check_box(label="Pre Analysis", widget_name="pre_analysis", opt="pre_analysis"))
+        layout.addLayout(
+            self._add_check_box(
+                label="Pre Analysis", widget_name="pre_analysis", opt="pre_analysis", connect=self.pa_changed
+            )
+        )
         return layout
 
     def init_level(self):
@@ -217,6 +227,16 @@ class VCEENCCAVC(SettingPanel):
         )
         return layout
 
+    def init_qvbr_quality(self):
+        return self._add_combo_box(
+            label="QVBR Quality",
+            widget_name="qvbr_quality",
+            tooltip="Quality based VBR (--qvbr), lower is higher quality. Replaces the Bitrate or QP selection above.\nOff uses the selected rate control mode",
+            options=["off"] + [str(x) for x in range(1, 52)],
+            opt="qvbr_quality",
+            min_width=60,
+        )
+
     def init_b_frames(self):
         return self._add_combo_box(
             widget_name="b_frames",
@@ -233,16 +253,6 @@ class VCEENCCAVC(SettingPanel):
             options=[t("Auto")] + [str(x) for x in range(17)],
             opt="ref",
             min_width=60,
-        )
-
-    def init_decoder(self):
-        return self._add_combo_box(
-            widget_name="decoder",
-            label="Decoder",
-            options=["Hardware", "Software"],
-            opt="decoder",
-            tooltip="Hardware: use libavformat + hardware decoder for input\nSoftware: use avcodec + software decoder",
-            min_width=80,
         )
 
     def init_metrics(self):
@@ -278,6 +288,7 @@ class VCEENCCAVC(SettingPanel):
             max_q=self.widgets.max_q.currentText() if self.widgets.max_q.currentIndex() != 0 else None,
             min_q=self.widgets.min_q.currentText() if self.widgets.min_q.currentIndex() != 0 else None,
             extra=self.ffmpeg_extras,
+            qvbr_quality=self.widgets.qvbr_quality.currentText(),
             metrics=self.widgets.metrics.isChecked(),
             level=self.widgets.level.currentText() if self.widgets.level.currentIndex() != 0 else None,
             b_frames=self.widgets.b_frames.currentText() if self.widgets.b_frames.currentIndex() != 0 else None,
@@ -286,6 +297,23 @@ class VCEENCCAVC(SettingPanel):
             pre_analysis=self.widgets.pre_analysis.isChecked(),
             vbaq=self.widgets.vbaq.isChecked(),
             decoder=self.widgets.decoder.currentText(),
+            profile=self.widgets.profile.currentText(),
+            device=int(self.widgets.device.currentText().split(":", 1)[0] or 0),
+            pa_sc=self.widgets.pa_sc.currentText(),
+            pa_ss=self.widgets.pa_ss.currentText(),
+            pa_activity_type=self.widgets.pa_activity_type.currentText(),
+            pa_caq_strength=self.widgets.pa_caq_strength.currentText(),
+            pa_initqpsc=self.widgets.pa_initqpsc.currentIndex() or None,
+            pa_lookahead=self.widgets.pa_lookahead.currentIndex() or None,
+            pa_fskip_maxqp=int(self.widgets.pa_fskip_maxqp.text() or 0) or None,
+            pa_ltr=self.widgets.pa_ltr.isChecked(),
+            pa_paq=self.widgets.pa_paq.currentText(),
+            pa_taq=None if self.widgets.pa_taq.currentIndex() == 0 else self.widgets.pa_taq.currentText(),
+            pa_motion_quality=self.widgets.pa_motion_quality.currentText(),
+            output_depth=(
+                None if self.widgets.output_depth.currentIndex() == 0 else self.widgets.output_depth.currentText()
+            ),
+            split_mode=self.widgets.split_mode.currentText(),
         )
 
         encode_type, q_value = self.get_mode_settings()

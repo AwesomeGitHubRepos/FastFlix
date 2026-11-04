@@ -3,15 +3,14 @@ import logging
 import re
 
 import mistune
-from qtpy import QtCore, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
-from fastflix.resources import changes_file, local_changes_file
+from fastflix.resources import changes_file, local_changes_file, local_package_changes_file
 
 __all__ = ["Changes"]
 
 logger = logging.getLogger("fastflix")
 
-markdown = mistune.Markdown()
 
 issues = re.compile(r"\s(#\d+)\s")
 
@@ -28,16 +27,18 @@ class Changes(QtWidgets.QScrollArea):
 
         if changes_file.exists():
             content = changes_file.read_text(encoding="utf-8", errors="ignore")
+        elif local_package_changes_file.exists():
+            content = local_package_changes_file.read_text(encoding="utf-8", errors="ignore")
         else:
             if not local_changes_file.exists():
-                raise Exception("Could not locate changlog file")
+                raise Exception("Could not locate changelog file")
             content = local_changes_file.read_text(encoding="utf-8", errors="ignore")
 
         linked_content = issues.sub(
             " <a href='https://github.com/cdgriffith/FastFlix/issues/\\1' style='color: black' >\\1</a> ", content
         ).replace("issues/#", "issues/")
 
-        self.label = QtWidgets.QLabel(markdown(linked_content))
+        self.label = QtWidgets.QLabel(mistune.html(linked_content))
         self.label.setOpenExternalLinks(True)
 
         # setting alignment to the text

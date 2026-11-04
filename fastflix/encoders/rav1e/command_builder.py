@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 
 import logging
-import re
 import secrets
+import shlex
 
+from fastflix.encoders.common.hdr_metadata import is_hdr_bit_depth, parse_master_display
 from fastflix.encoders.common.helpers import Command, generate_all, generate_color_details, null
 from fastflix.models.encode import rav1eSettings
 from fastflix.models.fastflix import FastFlix
@@ -14,53 +15,71 @@ logger = logging.getLogger("fastflix")
 
 def build(fastflix: FastFlix):
     settings: rav1eSettings = fastflix.current_video.video_settings.video_encoder_settings
-    beginning, ending = generate_all(fastflix, "librav1e")
+    beginning, ending, output_fps = generate_all(fastflix, "librav1e")
 
-    beginning += (
-        "-strict experimental "
-        f"-speed {settings.speed} "
-        f"-tile-columns {settings.tile_columns} "
-        f"-tile-rows {settings.tile_rows} "
-        f"-tiles {settings.tiles} "
-        f"{generate_color_details(fastflix)} "
+    beginning.extend(
+        [
+            "-speed",
+            str(settings.speed),
+            "-tile-columns",
+            str(settings.tile_columns),
+            "-tile-rows",
+            str(settings.tile_rows),
+            "-tiles",
+            str(settings.tiles),
+        ]
     )
+    beginning.extend(generate_color_details(fastflix))
 
-    # if not fastflix.current_video.video_settings.remove_hdr:
+    rav1e_params = settings.rav1e_params.copy()
 
-    # Currently unsupported https://github.com/xiph/rav1e/issues/2554
-    #         rav1e_options = []
-    # if side_data.master_display:
-    #     rav1e_options.append(
-    #         "mastering-display="
-    #         f"G{side_data.master_display.green}"
-    #         f"B{side_data.master_display.blue}"
-    #         f"R{side_data.master_display.red}"
-    #         f"WP{side_data.master_display.white}"
-    #         f"L{side_data.master_display.luminance}"
-    #     )
-    #
-    # if side_data.cll:
-    #     rav1e_options.append(f"content-light={side_data.cll}")
-    # if rav1e_options:
-    #     opts = ":".join(rav1e_options)
-    #     beginning += f'-rav1e-params "{opts}"'
+    if settings.tune != "default":
+        rav1e_params.append(f"tune={settings.tune}")
+
+    if settings.photon_noise > 0:
+        rav1e_params.append(f"photon_noise={settings.photon_noise}")
+
+    if not settings.scene_detection:
+        rav1e_params.append("no_scene_detection=true")
+
+    if not fastflix.current_video.video_settings.remove_hdr:
+        if is_hdr_bit_depth(settings.pix_fmt):
+            master_display = parse_master_display(fastflix.current_video.master_display)
+            if master_display:
+                rav1e_params.append(f"mastering_display={master_display.to_rav1e()}")
+
+            if fastflix.current_video.cll:
+                rav1e_params.append(f"content_light={fastflix.current_video.cll}")
+
+    if rav1e_params:
+        beginning.extend(["-rav1e-params", ":".join(rav1e_params)])
 
     if not settings.single_pass:
         pass_log_file = fastflix.current_video.work_path / f"pass_log_file_{secrets.token_hex(10)}"
-        beginning += f'-passlogfile "{pass_log_file}" '
+        beginning.extend(["-passlogfile", str(pass_log_file)])
 
     pass_type = "bitrate" if settings.bitrate else "QP"
 
+    extra = shlex.split(settings.extra) if settings.extra else []
+    extra_both = shlex.split(settings.extra) if settings.extra and settings.extra_both_passes else []
+
     if not settings.bitrate:
-        command_1 = f"{beginning} -qp {settings.qp} {settings.extra} {ending}"
+        command_1 = beginning + ["-qp", str(settings.qp)] + extra + ending
         return [Command(command=command_1, name=f"{pass_type}", exe="ffmpeg")]
 
     if settings.single_pass:
-        command_1 = f"{beginning} -b:v {settings.bitrate} {settings.extra} {ending}"
+        command_1 = beginning + ["-b:v", settings.bitrate] + extra + ending
         return [Command(command=command_1, name=f"{pass_type}", exe="ffmpeg")]
     else:
-        command_1 = f"{beginning} -b:v {settings.bitrate} -pass 1 {settings.extra if settings.extra_both_passes else ''} -an -f matroska {null}"
-        command_2 = f"{beginning} -b:v {settings.bitrate} -pass 2 {settings.extra} {ending}"
+        command_1 = (
+            beginning
+            + ["-b:v", settings.bitrate, "-pass", "1"]
+            + extra_both
+            + ["-an"]
+            + output_fps
+            + ["-f", "matroska", null]
+        )
+        command_2 = beginning + ["-b:v", settings.bitrate, "-pass", "2"] + extra + ending
         return [
             Command(command=command_1, name=f"First pass {pass_type}", exe="ffmpeg"),
             Command(command=command_2, name=f"Second pass {pass_type} ", exe="ffmpeg"),

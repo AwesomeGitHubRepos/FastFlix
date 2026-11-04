@@ -1,18 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import logging
-from pathlib import Path
 
-from box import Box
-from qtpy import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastflix.encoders.common.setting_panel import SettingPanel
 from fastflix.language import t
 from fastflix.models.encode import x265Settings
 from fastflix.models.fastflix_app import FastFlixApp
-from fastflix.resources import loading_movie, warning_icon
+from fastflix.resources import loading_movie, get_icon
 from fastflix.shared import link
-from fastflix.widgets.background_tasks import ExtractHDR10
 
 logger = logging.getLogger("fastflix")
 
@@ -52,7 +49,25 @@ recommended_crfs = [
     "Custom",
 ]
 
-pix_fmts = ["8-bit: yuv420p", "10-bit: yuv420p10le", "12-bit: yuv420p12le"]
+pix_fmts = [
+    "8-bit: yuv420p",
+    "10-bit: yuv420p10le",
+    "12-bit: yuv420p12le",
+    "8-bit 422: yuv422p",
+    "8-bit 444: yuv444p",
+    "10-bit 422: yuv422p10le",
+    "10-bit 444: yuv444p10le",
+    "12-bit 422: yuv422p12le",
+    "12-bit 444: yuv444p12le",
+]
+
+# fmt: off
+gop_sizes = [t("Auto"), "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+             "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34",
+             "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51",
+             "52", "53", "54", "55", "56", "57", "58", "59", "60", "70", "80", "90", "100", "110", "120", "140", "160",
+             "180", "200", "220", "240", "260", "280", "300", "400", "500", "600", "700", "800", "900", "1000"]
+# fmt: on
 
 
 def get_breaker():
@@ -86,7 +101,7 @@ class HEVC(SettingPanel):
 
         breaker = QtWidgets.QHBoxLayout()
         breaker_label = QtWidgets.QLabel(t("Advanced"))
-        breaker_label.setFont(QtGui.QFont("helvetica", 8, weight=55))
+        # breaker_label.setFont(QtGui.QFont("", 8, weight=55))
 
         breaker.addWidget(get_breaker(), stretch=1)
         breaker.addWidget(breaker_label, alignment=QtCore.Qt.AlignHCenter)
@@ -97,6 +112,7 @@ class HEVC(SettingPanel):
         grid.addLayout(self.init_aq_mode(), 6, 0, 1, 2)
         grid.addLayout(self.init_frame_threads(), 7, 0, 1, 2)
         grid.addLayout(self.init_max_mux(), 8, 0, 1, 2)
+        # grid.addLayout(self.init_gop(), 9, 0, 1, 2)
         grid.addLayout(self.init_x265_row(), 6, 2, 1, 4)
         grid.addLayout(self.init_x265_row_two(), 7, 2, 1, 4)
         # grid.addLayout(self.init_hdr10_opt(), 5, 2, 1, 1)
@@ -112,26 +128,24 @@ class HEVC(SettingPanel):
 
         grid.setRowStretch(11, True)
 
-        grid.addLayout(self._add_custom(), 12, 0, 1, 6)
+        custom_layout = self._add_custom()
 
         link_1 = link(
             "https://trac.ffmpeg.org/wiki/Encode/H.265",
             t("FFMPEG HEVC / H.265 Encoding Guide"),
+            app.fastflix.config.theme,
         )
         link_2 = link(
             "https://codecalamity.com/encoding-uhd-4k-hdr10-videos-with-ffmpeg",
             t("CodeCalamity UHD HDR Encoding Guide"),
-        )
-        link_3 = link(
-            "https://github.com/cdgriffith/FastFlix/wiki/HDR10-Plus-Metadata-Extraction",
-            t("HDR10+ Metadata Extraction"),
+            app.fastflix.config.theme,
         )
 
-        guide_label = QtWidgets.QLabel(f"{link_1} | {link_2} | {link_3}")
-        guide_label.setAlignment(QtCore.Qt.AlignBottom)
+        guide_label = QtWidgets.QLabel(f"{link_1} | {link_2}")
         guide_label.setOpenExternalLinks(True)
+        custom_layout.addWidget(guide_label)
 
-        grid.addWidget(guide_label, 13, 0, 1, 6)
+        grid.addLayout(custom_layout, 12, 0, 1, 6)
 
         self.hdr10plus_signal.connect(self.done_hdr10plus_extract)
         self.hdr10plus_ffmpeg_signal.connect(lambda x: self.ffmpeg_level.setText(x))
@@ -145,6 +159,15 @@ class HEVC(SettingPanel):
             button_action=lambda: self.dhdr10_update(),
             tooltip="dhdr10_info: Path to HDR10+ JSON metadata file",
         )
+        # Replace plain label with clickable wiki link
+        self.labels["hdr10plus_metadata"].setText(
+            link(
+                "https://github.com/cdgriffith/FastFlix/wiki/HDR10-Plus-Metadata-Extraction",
+                t("HDR10+ Metadata"),
+                self.app.fastflix.config.theme,
+            )
+        )
+        self.labels["hdr10plus_metadata"].setOpenExternalLinks(True)
         self.labels["hdr10plus_metadata"].setFixedWidth(200)
         return layout
 
@@ -156,7 +179,7 @@ class HEVC(SettingPanel):
             "The latest windows builds from BtbN should have this feature.\n"
             "I do not know of any public Linux/Mac ones that do."
         )
-        icon = QtGui.QIcon(warning_icon)
+        icon = QtGui.QIcon(get_icon("onyx-warning", self.app.fastflix.config.theme))
         label.setPixmap(icon.pixmap(22))
         layout = QtWidgets.QHBoxLayout()
 
@@ -326,7 +349,7 @@ class HEVC(SettingPanel):
             widget_name="intra_encoding",
             tooltip=(
                 "keyint: Enable Intra-Encoding by forcing keyframes every 1 second (Blu-ray spec)\n"
-                "This option is not recommenced unless you need to conform \n"
+                "This option is not recommended unless you need to conform \n"
                 "to Blu-ray standards to burn to a physical disk"
             ),
             opt="intra_encoding",
@@ -360,7 +383,7 @@ class HEVC(SettingPanel):
         )
 
     def init_lossless(self):
-        return self._add_check_box(
+        layout = self._add_check_box(
             label="Lossless",
             widget_name="lossless",
             tooltip=(
@@ -371,7 +394,19 @@ class HEVC(SettingPanel):
                 "Slower presets will generally achieve better compression efficiency (and generate smaller bitstreams)."
             ),
             opt="lossless",
+            connect=lambda: (self._toggle_lossless(), self.main.page_update(build_thumbnail=False)),
         )
+        return layout
+
+    def _toggle_lossless(self):
+        enabled = not self.widgets.lossless.isChecked()
+        self.qp_radio.setEnabled(enabled)
+        self.bitrate_radio.setEnabled(enabled)
+        self.widgets.crf.setEnabled(enabled)
+        self.widgets.custom_crf.setEnabled(enabled)
+        self.widgets.bitrate.setEnabled(enabled)
+        self.widgets.custom_bitrate.setEnabled(enabled)
+        self.widgets.bitrate_passes.setEnabled(enabled)
 
     def init_preset(self):
         layout = self._add_combo_box(
@@ -380,12 +415,66 @@ class HEVC(SettingPanel):
             options=presets,
             tooltip=(
                 "preset: The slower the preset, the better the compression and quality\n"
-                "Slow is highest personal recommenced, as past that is much smaller gains"
+                "Slow is the slowest preset personally recommended,\n"
+                "presets slower than this result in much smaller gains"
             ),
-            connect="default",
+            connect=self.preset_update,
             opt="preset",
         )
         return layout
+
+    def preset_update(self):
+        def set_aq(num):
+            if self.widgets.tune.currentIndex() == 0:
+                self.widgets.aq_mode.setCurrentIndex(num)
+            if self.widgets["tune"].currentText() == "animation":
+                bframes = 5
+                if self.widgets.preset.currentIndex() >= 2:
+                    bframes = 6
+                if self.widgets.preset.currentIndex() >= 7:
+                    bframes = 10
+                self.widgets.bframes.setCurrentIndex(bframes)
+
+        if self.widgets["preset"].currentText() == "ultrafast":
+            self.widgets.bframes.setCurrentIndex(3)
+            self.widgets.b_adapt.setCurrentIndex(0)
+            set_aq(0)
+        elif self.widgets["preset"].currentText() == "superfast":
+            self.widgets.bframes.setCurrentIndex(3)
+            self.widgets.b_adapt.setCurrentIndex(0)
+            set_aq(0)
+        elif self.widgets["preset"].currentText() == "veryfast":
+            self.widgets.bframes.setCurrentIndex(4)
+            self.widgets.b_adapt.setCurrentIndex(0)
+            set_aq(2)
+        elif self.widgets["preset"].currentText() == "faster":
+            self.widgets.bframes.setCurrentIndex(4)
+            self.widgets.b_adapt.setCurrentIndex(0)
+            set_aq(2)
+        elif self.widgets["preset"].currentText() == "fast":
+            self.widgets.bframes.setCurrentIndex(4)
+            self.widgets.b_adapt.setCurrentIndex(0)
+            set_aq(2)
+        elif self.widgets["preset"].currentText() == "medium":
+            self.widgets.bframes.setCurrentIndex(4)
+            self.widgets.b_adapt.setCurrentIndex(2)
+            set_aq(2)
+        elif self.widgets["preset"].currentText() == "slow":
+            self.widgets.bframes.setCurrentIndex(4)
+            self.widgets.b_adapt.setCurrentIndex(2)
+            set_aq(2)
+        elif self.widgets["preset"].currentText() == "slower":
+            self.widgets.bframes.setCurrentIndex(8)
+            self.widgets.b_adapt.setCurrentIndex(2)
+            set_aq(2)
+        elif self.widgets["preset"].currentText() == "veryslow":
+            self.widgets.bframes.setCurrentIndex(8)
+            self.widgets.b_adapt.setCurrentIndex(2)
+            set_aq(2)
+        elif self.widgets["preset"].currentText() == "placebo":
+            self.widgets.bframes.setCurrentIndex(8)
+            self.widgets.b_adapt.setCurrentIndex(2)
+            set_aq(2)
 
     def init_tune(self):
         return self._add_combo_box(
@@ -393,16 +482,74 @@ class HEVC(SettingPanel):
             widget_name="tune",
             options=["default", "psnr", "ssim", "grain", "zerolatency", "fastdecode", "animation"],
             tooltip="tune: Tune the settings for a particular type of source or situation",
-            connect="default",
+            connect=self.tune_update,
             opt="tune",
         )
+
+    def tune_update(self):
+        self.widgets.aq_mode.setEnabled(True)
+        self.widgets.bframes.setEnabled(True)
+        self.widgets.b_adapt.setEnabled(True)
+        self.widgets.frame_threads.setEnabled(True)
+        self.widgets.aq_mode.setCurrentIndex(2)
+        self.widgets.bframes.setCurrentIndex(4)
+        self.widgets.b_adapt.setCurrentIndex(2)
+        self.widgets.frame_threads.setCurrentIndex(0)
+
+        if self.widgets["tune"].currentText() == "grain":
+            self.widgets.aq_mode.setCurrentIndex(0)
+            self.widgets.aq_mode.setEnabled(False)
+            self.widgets.bframes.setCurrentIndex(4)
+            self.widgets.b_adapt.setCurrentIndex(2)
+        elif self.widgets["tune"].currentText() == "psnr":
+            self.widgets.aq_mode.setCurrentIndex(0)
+            self.widgets.aq_mode.setEnabled(False)
+            self.widgets.bframes.setCurrentIndex(4)
+            self.widgets.b_adapt.setCurrentIndex(2)
+        elif self.widgets["tune"].currentText() == "zerolatency":
+            self.widgets.bframes.setCurrentIndex(0)
+            self.widgets.b_adapt.setCurrentIndex(0)
+            self.widgets.frame_treahds.setCurrentIndex(1)
+            self.widgets.bframes.setEnabled(False)
+            self.widgets.b_adapt.setEnabled(False)
+            self.widgets.frame_threads.setEnabled(False)
+        elif self.widgets["tune"].currentText() == "animation":
+            bframes = 5
+            if self.widgets.preset.currentIndex() >= 2:
+                bframes = 6
+            if self.widgets.preset.currentIndex() >= 7:
+                bframes = 10
+            self.widgets.bframes.setCurrentIndex(bframes)
 
     def init_profile(self):
         return self._add_combo_box(
             label="Profile_encoderopt",
             tooltip="profile: Enforce an encode profile",
             widget_name="profile",
-            options=["default", "main", "main10", "mainstillpicture"],
+            options=[
+                "default",
+                "main",
+                "main10",
+                "mainstillpicture",
+                "msp",
+                "main-intra",
+                "main10-intra",
+                "main444-8",
+                "main444-intra",
+                "main444-stillpicture",
+                "main422-10 ",
+                "main422-10-intra",
+                "main444-10",
+                "main444-10-intra",
+                "main12",
+                "main12-intra",
+                "main422-12 ",
+                "main422-12-intra",
+                "main444-12 ",
+                "main444-12-intra",
+                "main444-16-intra ",
+                "main444-16-stillpicture",
+            ],
             opt="profile",
         )
 
@@ -425,8 +572,13 @@ class HEVC(SettingPanel):
             opt="max_muxing_queue_size",
         )
 
+    def init_gop(self):
+        return self._add_combo_box(
+            label="Gop Size", tooltip="GOP Size", widget_name="gop_size", opt="gop_size", options=gop_sizes
+        )
+
     def init_modes(self):
-        return self._add_modes(recommended_bitrates, recommended_crfs, qp_name="crf")
+        return self._add_modes(recommended_bitrates, recommended_crfs, qp_name="crf", show_bitrate_passes=True)
 
     def mode_update(self):
         self.widgets.custom_crf.setDisabled(self.widgets.crf.currentText() != "Custom")
@@ -489,11 +641,10 @@ class HEVC(SettingPanel):
             self.updating_settings = False
             return
 
-        bit_depth = self.app.fastflix.current_video.streams["video"][self.main.video_track].bit_depth
         if self.main.remove_hdr:
-            self.widgets.pix_fmt.clear()
-            self.widgets.pix_fmt.addItems([pix_fmts[0]])
-            self.widgets.pix_fmt.setCurrentIndex(0)
+            # self.widgets.pix_fmt.clear()
+            # self.widgets.pix_fmt.addItems([pix_fmts[0]])
+            # self.widgets.pix_fmt.setCurrentIndex(0)
             self.widgets.hdr10_opt.setDisabled(True)
             self.widgets.hdr10_opt.setChecked(False)
             self.widgets.hdr10.setDisabled(True)
@@ -501,18 +652,18 @@ class HEVC(SettingPanel):
             self.widgets.repeat_headers.setChecked(False)
             self.widgets.repeat_headers.setDisabled(False)
         else:
-            self.widgets.pix_fmt.clear()
-            if bit_depth == 12:
-                self.widgets.pix_fmt.addItems(pix_fmts[2:])
-                self.widgets.pix_fmt.setCurrentIndex(0)
-            elif bit_depth == 10:
-                self.widgets.pix_fmt.addItems(pix_fmts[1:])
-                self.widgets.pix_fmt.setCurrentIndex(0)
-            else:
-                self.widgets.pix_fmt.addItems(pix_fmts)
-                self.widgets.pix_fmt.setCurrentIndex(1)
-
+            # bit_depth = self.app.fastflix.current_video.streams["video"][self.main.video_track].bit_depth
+            # self.widgets.pix_fmt.clear()
+            # # if bit_depth == 12:
+            # #     self.widgets.pix_fmt.addItems(pix_fmts[2:])
+            # #     self.widgets.pix_fmt.setCurrentIndex(0)
+            # if bit_depth >= 10:
+            #     self.widgets.pix_fmt.addItems(pix_fmts[1:])
+            #     self.widgets.pix_fmt.setCurrentIndex(0)
+            # else:
             hdr_opts()
+        # self.widgets.pix_fmt.addItems(pix_fmts)
+        # self.widgets.pix_fmt.setCurrentIndex(1)
 
         if update:
             self.main.page_update()
@@ -561,6 +712,8 @@ class HEVC(SettingPanel):
             lossless=self.widgets.lossless.isChecked(),
             extra=self.ffmpeg_extras,
             extra_both_passes=self.widgets.extra_both_passes.isChecked(),
+            bitrate_passes=int(self.widgets.bitrate_passes.currentText() or 1),
+            # gop_size=int(self.widgets.gop_size.currentText()) if self.widgets.gop_size.currentIndex() > 0 else 0,
         )
 
         encode_type, q_value = self.get_mode_settings()

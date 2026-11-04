@@ -5,17 +5,22 @@ proprietary format, and requires checking in binary files to git.
 
 So here is an easy stand-in that is better in ways I care about.
 """
+
 import os
 from functools import lru_cache
 from pathlib import Path
+import importlib.resources
 
-from appdirs import user_data_dir
-from box import Box
 from iso639 import Lang
+from platformdirs import user_data_dir
+from box import Box
 
-from fastflix.resources import language_file
+ref = importlib.resources.files("fastflix") / "data/languages.yaml"
+with importlib.resources.as_file(ref) as lf:
+    language_file = str(lf.resolve())
 
-__all__ = ["t", "translate"]
+
+__all__ = ["t", "translate", "Language"]
 
 config = os.getenv("FF_CONFIG")
 if config:
@@ -37,7 +42,7 @@ if not language:
 
 language_data = Box.from_yaml(filename=language_file, encoding="utf-8")
 
-if language not in ("deu", "eng", "fra", "ita", "spa", "zho"):
+if language not in ("deu", "eng", "fra", "ita", "spa", "chs", "rus", "jpn", "pol", "swe", "por", "ukr", "kor", "ron"):
     print(f"WARNING: {language} is not a supported language, defaulting to eng")
     language = "eng"
 
@@ -54,3 +59,18 @@ def translate(text):
 
 
 t = translate
+
+
+class Language(Lang):
+    _data = Lang._data.copy()
+    _data["name"]["Undefined"] = {
+        "pt1": "un",
+        "pt2b": "und",
+        "pt2t": "und",
+        "pt3": "und",
+        "pt5": "",
+        "name": "Undefined",
+    }
+    _data["pt2b"]["und"] = {"name": "Undefined", "pt1": "un", "pt2t": "und", "pt3": "und", "pt5": ""}
+    _data["pt3"]["und"] = {"name": "Undefined", "pt2b": "und", "pt1": "un", "pt2t": "und", "pt5": ""}
+    _data["pt1"]["un"] = {"name": "Undefined", "pt2b": "und", "pt2t": "und", "pt3": "und", "pt5": ""}

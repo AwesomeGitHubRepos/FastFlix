@@ -3,27 +3,38 @@ from pathlib import Path
 from typing import List
 
 from fastflix.models.encode import AttachmentTrack
-from fastflix.shared import clean_file_string
 
 
-def image_type(file: Path):
+def image_type(file: Path | str) -> tuple[str | None, str | None]:
+    if not file:
+        return None, None
     mime_type = "image/jpeg"
     ext_type = "jpg"
-    if file.name.lower().endswith("png"):
+    if Path(file).suffix.lower() == ".png":
         mime_type = "image/png"
         ext_type = "png"
     return mime_type, ext_type
 
 
-def build_attachments(attachments: List[AttachmentTrack]) -> str:
-
+def build_attachments(attachments: list[AttachmentTrack], mapped_attachment_count: int = 0) -> List[str]:
+    """
+    FFmpeg creates -attach streams after all mapped streams, so address them by attachment-type index
+    (after any attachment streams mapped from the source) rather than a stored absolute stream index.
+    """
     commands = []
+    attachment_index = mapped_attachment_count
     for attachment in attachments:
         if attachment.attachment_type == "cover":
             mime_type, ext_type = image_type(attachment.file_path)
-            clean_path = clean_file_string(attachment.file_path)
-            commands.append(
-                f' -attach "{clean_path}" -metadata:s:{attachment.outdex} mimetype="{mime_type}" '
-                f'-metadata:s:{attachment.outdex}  filename="{attachment.filename}.{ext_type}" '
+            commands.extend(
+                [
+                    "-attach",
+                    str(attachment.file_path),
+                    f"-metadata:s:t:{attachment_index}",
+                    f"mimetype={mime_type}",
+                    f"-metadata:s:t:{attachment_index}",
+                    f"filename={attachment.filename}.{ext_type}",
+                ]
             )
-    return " ".join(commands)
+            attachment_index += 1
+    return commands

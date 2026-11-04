@@ -4,22 +4,48 @@ import logging
 import shutil
 from pathlib import Path
 
-from iso639 import Lang
+from iso639 import iter_langs
 from iso639.exceptions import InvalidLanguageValue
-from qtpy import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastflix.exceptions import FastFlixInternalException
-from fastflix.language import t
+from fastflix.language import t, Language
 from fastflix.models.fastflix_app import FastFlixApp
-from fastflix.shared import error_message
+from fastflix.naming import (
+    PRE_ENCODE_VARIABLES,
+    POST_ENCODE_VARIABLES,
+    ALL_VARIABLES,
+    generate_preview,
+    validate_template,
+)
+from fastflix.shared import error_message, link, yes_no_message
+from fastflix.widgets.flow_layout import FlowLayout
+from fastflix.widgets.toggle_switch import ToggleSwitch
 
 logger = logging.getLogger("fastflix")
-language_list = sorted((k for k, v in Lang._data["name"].items() if v["pt2B"] and v["pt1"]), key=lambda x: x.lower())
+language_list = [v.name for v in iter_langs() if v.pt2b and v.pt1]
 
-known_language_list = ["English", "Chinese", "Italian", "French", "Spanish", "German"]
+known_language_list = [
+    "English",
+    "Chinese (Simplified)",
+    "Italian",
+    "French",
+    "Spanish",
+    "German",
+    "Japanese",
+    "Russian",
+    "Portuguese",
+    "Swedish",
+    "Polish",
+    "Romanian",
+    "Ukrainian",
+    "Korean",
+    # "Chinese (Traditional)"    #reserved for future use
+]
 possible_detect_points = ["1", "2", "4", "6", "8", "10", "15", "20", "25", "50", "100"]
 
-# "Japanese", "Korean", "Hindi", "Russian",  "Portuguese"
+scale_digits = ["0", "1", "1.25", "1.5", "1.75", "2", "2.5", "3"]
+scale_percents = ["Disable Scaling", "100%", "125%", "150%", "175%", "200%", "250%", "300%"]
 
 
 class Settings(QtWidgets.QWidget):
@@ -30,56 +56,18 @@ class Settings(QtWidgets.QWidget):
         self.config_file = self.app.fastflix.config.config_path
         self.setWindowTitle(t("Settings"))
         self.setMinimumSize(600, 200)
-        layout = QtWidgets.QGridLayout()
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Window)
 
-        ffmpeg_label = QtWidgets.QLabel("FFmpeg")
-        self.ffmpeg_path = QtWidgets.QLineEdit()
-        self.ffmpeg_path.setText(str(self.app.fastflix.config.ffmpeg))
-        ffmpeg_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
-        ffmpeg_path_button.clicked.connect(lambda: self.select_ffmpeg())
-        layout.addWidget(ffmpeg_label, 0, 0)
-        layout.addWidget(self.ffmpeg_path, 0, 1)
-        layout.addWidget(ffmpeg_path_button, 0, 2)
+        main_layout = QtWidgets.QVBoxLayout()
 
-        ffprobe_label = QtWidgets.QLabel("FFprobe")
-        self.ffprobe_path = QtWidgets.QLineEdit()
-        self.ffprobe_path.setText(str(self.app.fastflix.config.ffprobe))
-        ffprobe_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
-        ffprobe_path_button.clicked.connect(lambda: self.select_ffprobe())
-        layout.addWidget(ffprobe_label, 1, 0)
-        layout.addWidget(self.ffprobe_path, 1, 1)
-        layout.addWidget(ffprobe_path_button, 1, 2)
+        tab_widget = QtWidgets.QTabWidget()
+        tab_widget.addTab(self._build_settings_tab(), t("Settings"))
+        tab_widget.addTab(self._build_output_naming_tab(), t("Output Naming"))
+        tab_widget.addTab(self._build_audio_encoders_tab(), t("Audio Encoders"))
+        tab_widget.addTab(self._build_locations_tab(), t("Application Locations"))
+        main_layout.addWidget(tab_widget)
 
-        work_dir_label = QtWidgets.QLabel(t("Work Directory"))
-        self.work_dir = QtWidgets.QLineEdit()
-        self.work_dir.setText(str(self.app.fastflix.config.work_path))
-        work_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
-        work_path_button.clicked.connect(lambda: self.select_work_path())
-        layout.addWidget(work_dir_label, 2, 0)
-        layout.addWidget(self.work_dir, 2, 1)
-        layout.addWidget(work_path_button, 2, 2)
-
-        layout.addWidget(QtWidgets.QLabel(t("Config File")), 4, 0)
-        layout.addWidget(QtWidgets.QLabel(str(self.config_file)), 4, 1)
-
-        self.language_combo = QtWidgets.QComboBox(self)
-        self.language_combo.addItems(known_language_list)
-        try:
-            index = known_language_list.index(Lang(self.app.fastflix.config.language).name)
-        except (IndexError, InvalidLanguageValue):
-            logger.exception(f"{t('Could not find language for')} {self.app.fastflix.config.language}")
-            index = known_language_list.index("English")
-        self.language_combo.setCurrentIndex(index)
-
-        layout.addWidget(QtWidgets.QLabel(t("Language")), 5, 0)
-        layout.addWidget(self.language_combo, 5, 1)
-
-        config_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
-        config_button.clicked.connect(
-            lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self.config_file)))
-        )
-        layout.addWidget(config_button, 4, 2)
-
+        # Save/Cancel buttons at the bottom (outside tabs)
         save = QtWidgets.QPushButton(
             icon=self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton), text=t("Save")
         )
@@ -90,86 +78,621 @@ class Settings(QtWidgets.QWidget):
         )
         cancel.clicked.connect(lambda: self.close())
 
-        self.use_sane_audio = QtWidgets.QCheckBox(t("Use Sane Audio Selection (updatable in config file)"))
-        if self.app.fastflix.config.use_sane_audio:
-            self.use_sane_audio.setChecked(True)
-        self.disable_version_check = QtWidgets.QCheckBox(t("Disable update check on startup"))
-        if not self.app.fastflix.config.disable_version_check:
-            self.disable_version_check.setChecked(False)
-        elif self.app.fastflix.config.disable_version_check:
-            self.disable_version_check.setChecked(True)
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(cancel)
+        button_layout.addWidget(save)
+        main_layout.addLayout(button_layout)
 
+        self.setLayout(main_layout)
+
+    def _build_settings_tab(self):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QGridLayout()
+        layout.setColumnStretch(1, 1)
+        row = 0
+
+        # Config File
+        layout.addWidget(QtWidgets.QLabel(t("Config File")), row, 0)
+        layout.addWidget(QtWidgets.QLabel(str(self.config_file)), row, 1)
+        config_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_FileIcon))
+        config_button.setFixedWidth(30)
+        config_button.clicked.connect(
+            lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self.config_file)))
+        )
+        layout.addWidget(config_button, row, 2)
+        row += 1
+
+        # Work Directory
+        work_dir_label = QtWidgets.QLabel(t("Work Directory"))
+        self.work_dir = QtWidgets.QLineEdit()
+        self.work_dir.setText(str(self.app.fastflix.config.work_path))
+        work_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        work_path_button.setFixedWidth(30)
+        work_path_button.clicked.connect(lambda: self.select_work_path())
+        layout.addWidget(work_dir_label, row, 0)
+        layout.addWidget(self.work_dir, row, 1)
+        layout.addWidget(work_path_button, row, 2)
+        row += 1
+
+        # Language
+        self.language_combo = QtWidgets.QComboBox(self)
+        self.language_combo.addItems(known_language_list)
+        try:
+            if self.app.fastflix.config.language in ("chs", "zho"):
+                index = known_language_list.index("Chinese (Simplified)")
+            else:
+                index = known_language_list.index(Language(self.app.fastflix.config.language).name)
+        except (IndexError, InvalidLanguageValue):
+            logger.exception(f"{t('Could not find language for')} {self.app.fastflix.config.language}")
+            index = known_language_list.index("English")
+        self.language_combo.setCurrentIndex(index)
+        layout.addWidget(QtWidgets.QLabel(t("Language")), row, 0)
+        layout.addWidget(self.language_combo, row, 1)
+        row += 1
+
+        # Theme
+        self.theme = QtWidgets.QComboBox()
+        self.theme.addItems(["onyx", "light", "dark", "system"])
+        self.theme.setCurrentText(self.app.fastflix.config.theme)
+        layout.addWidget(QtWidgets.QLabel(t("Theme")), row, 0)
+        layout.addWidget(self.theme, row, 1)
+        row += 1
+
+        # GUI Logging Level
         self.logger_level_widget = QtWidgets.QComboBox()
         self.logger_level_widget.addItems(["Debug", "Info", "Warning", "Error"])
         self.logger_level_widget.setCurrentIndex(int(self.app.fastflix.config.logging_level // 10) - 1)
+        layout.addWidget(QtWidgets.QLabel(t("GUI Logging Level")), row, 0)
+        layout.addWidget(self.logger_level_widget, row, 1)
+        row += 1
 
-        self.flat_ui = QtWidgets.QCheckBox(t("Flat UI"))
-        self.flat_ui.setChecked(self.app.fastflix.config.flat_ui)
-
+        # Crop Detect Points
         self.crop_detect_points_widget = QtWidgets.QComboBox()
         self.crop_detect_points_widget.addItems(possible_detect_points)
-
         try:
             self.crop_detect_points_widget.setCurrentIndex(
                 possible_detect_points.index(str(self.app.fastflix.config.crop_detect_points))
             )
         except ValueError:
             self.crop_detect_points_widget.setCurrentIndex(5)
+        layout.addWidget(QtWidgets.QLabel(t("Crop Detect Points")), row, 0)
+        layout.addWidget(self.crop_detect_points_widget, row, 1)
+        row += 1
 
-        nvencc_label = QtWidgets.QLabel("NVEncC")
+        # UI Scale
+        self.ui_scale_widget = QtWidgets.QComboBox()
+        self.ui_scale_widget.addItems(scale_percents)
+        self.ui_scale_widget.setCurrentText(scale_percents[scale_digits.index(self.app.fastflix.config.ui_scale)])
+        layout.addWidget(QtWidgets.QLabel(t("UI Scale")), row, 0)
+        layout.addWidget(self.ui_scale_widget, row, 1)
+        row += 1
+
+        # Checkboxes
+        self.use_sane_audio = ToggleSwitch(t("Use Sane Audio Selection (updatable in config file)"))
+        if self.app.fastflix.config.use_sane_audio:
+            self.use_sane_audio.setChecked(True)
+        layout.addWidget(self.use_sane_audio, row, 0, 1, 2)
+        row += 1
+
+        self.disable_version_check = ToggleSwitch(t("Disable update check on startup"))
+        if self.app.fastflix.config.disable_version_check:
+            self.disable_version_check.setChecked(True)
+        layout.addWidget(self.disable_version_check, row, 0, 1, 2)
+        row += 1
+
+        self.show_complete_message = ToggleSwitch(t("Show completion popup message"))
+        self.show_complete_message.setChecked(self.app.fastflix.config.show_complete_message)
+        layout.addWidget(self.show_complete_message, row, 0, 1, 2)
+        row += 1
+
+        self.play_complete_sound = ToggleSwitch(t("Play a sound when the queue completes"))
+        self.play_complete_sound.setChecked(self.app.fastflix.config.play_complete_sound)
+        layout.addWidget(self.play_complete_sound, row, 0, 1, 2)
+        row += 1
+
+        self.show_error_message = ToggleSwitch(t("Show error popup message"))
+        self.show_error_message.setChecked(self.app.fastflix.config.show_error_message)
+        layout.addWidget(self.show_error_message, row, 0, 1, 2)
+        row += 1
+
+        self.keep_source_after_encode = ToggleSwitch(t("Keep source loaded after adding to queue"))
+        self.keep_source_after_encode.setChecked(self.app.fastflix.config.keep_source_after_encode)
+        layout.addWidget(self.keep_source_after_encode, row, 0, 1, 2)
+        row += 1
+
+        self.clean_old_logs_button = ToggleSwitch(
+            t("Remove GUI logs and compress conversion logs older than 30 days at exit")
+        )
+        self.clean_old_logs_button.setChecked(self.app.fastflix.config.clean_old_logs)
+        layout.addWidget(self.clean_old_logs_button, row, 0, 1, 3)
+        row += 1
+
+        self.disable_deinterlace_button = ToggleSwitch(t("Disable interlace check"))
+        self.disable_deinterlace_button.setChecked(self.app.fastflix.config.disable_deinterlace_check)
+        layout.addWidget(self.disable_deinterlace_button, row, 0, 1, 3)
+        row += 1
+
+        self.suppress_ffmpeg_version_warning = ToggleSwitch(t("Suppress FFmpeg version warning on startup"))
+        self.suppress_ffmpeg_version_warning.setChecked(self.app.fastflix.config.suppress_ffmpeg_version_warning)
+        layout.addWidget(self.suppress_ffmpeg_version_warning, row, 0, 1, 3)
+        row += 1
+
+        self.use_keyframes_for_preview = ToggleSwitch(t("Use keyframes for preview images"))
+        self.use_keyframes_for_preview.setChecked(self.app.fastflix.config.use_keyframes_for_preview)
+        layout.addWidget(self.use_keyframes_for_preview, row, 0, 1, 3)
+        row += 1
+
+        self.sticky_tabs = ToggleSwitch(t("Disable Automatic Tab Switching"))
+        self.sticky_tabs.setChecked(self.app.fastflix.config.sticky_tabs)
+        layout.addWidget(self.sticky_tabs, row, 0, 1, 2)
+        row += 1
+
+        self.auto_detect_subtitles = ToggleSwitch(t("Auto-detect external subtitle files"))
+        self.auto_detect_subtitles.setChecked(self.app.fastflix.config.auto_detect_subtitles)
+        layout.addWidget(self.auto_detect_subtitles, row, 0, 1, 3)
+        row += 1
+
+        self.enable_history = ToggleSwitch(t("Enable encoding history"))
+        self.enable_history.setChecked(bool(self.app.fastflix.config.enable_history))
+        layout.addWidget(self.enable_history, row, 0, 1, 3)
+        row += 1
+
+        # OpenCL Support
+        opencl_label = QtWidgets.QLabel(t("OpenCL Support"))
+        self.opencl_combo = QtWidgets.QComboBox()
+        self.opencl_combo.addItems([t("Auto"), t("Disable")])
+        if self.app.fastflix.config.opencl_support is False:
+            self.opencl_combo.setCurrentIndex(1)
+        else:
+            self.opencl_combo.setCurrentIndex(0)
+
+        self.opencl_status_label = QtWidgets.QLabel()
+        self._update_opencl_status()
+
+        opencl_detect_button = QtWidgets.QPushButton(t("Re-detect"))
+        opencl_detect_button.setFixedWidth(80)
+        opencl_detect_button.clicked.connect(self._run_opencl_detection)
+
+        opencl_row_layout = QtWidgets.QHBoxLayout()
+        opencl_row_layout.addWidget(self.opencl_combo)
+        opencl_row_layout.addWidget(self.opencl_status_label)
+        opencl_row_layout.addWidget(opencl_detect_button)
+
+        layout.addWidget(opencl_label, row, 0)
+        layout.addLayout(opencl_row_layout, row, 1, 1, 2)
+        row += 1
+
+        # Default Output Directory
+        self.default_output_dir = ToggleSwitch(t("Use same output directory as source file"))
+        layout.addWidget(self.default_output_dir, row, 0, 1, 2)
+        row += 1
+
+        output_label = QtWidgets.QLabel(t("Default Output Folder"))
+        self.output_path_line_edit = QtWidgets.QLineEdit()
+        if self.app.fastflix.config.output_directory:
+            self.output_path_line_edit.setText(str(self.app.fastflix.config.output_directory))
+        self.output_label_path_button = QtWidgets.QPushButton(
+            icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon)
+        )
+        self.output_label_path_button.setFixedWidth(30)
+        self.output_label_path_button.clicked.connect(lambda: self.select_output_directory())
+        layout.addWidget(output_label, row, 0)
+        layout.addWidget(self.output_path_line_edit, row, 1)
+        layout.addWidget(self.output_label_path_button, row, 2)
+        row += 1
+
+        if not self.app.fastflix.config.output_directory:
+            self.default_output_dir.setChecked(True)
+            self.output_path_line_edit.setDisabled(True)
+            self.output_label_path_button.setDisabled(True)
+
+        def out_click():
+            self.output_path_line_edit.setDisabled(self.output_path_line_edit.isEnabled())
+            self.output_label_path_button.setEnabled(self.output_path_line_edit.isEnabled())
+
+        self.default_output_dir.clicked.connect(out_click)
+
+        # Default Source Directory
+        self.default_source_dir = ToggleSwitch(t("No Default Source Folder"))
+        layout.addWidget(self.default_source_dir, row, 0, 1, 2)
+        row += 1
+
+        source_label = QtWidgets.QLabel(t("Default Source Folder"))
+        self.source_path_line_edit = QtWidgets.QLineEdit()
+        if self.app.fastflix.config.source_directory:
+            self.source_path_line_edit.setText(str(self.app.fastflix.config.source_directory))
+        self.source_label_path_button = QtWidgets.QPushButton(
+            icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon)
+        )
+        self.source_label_path_button.setFixedWidth(30)
+        self.source_label_path_button.clicked.connect(lambda: self.select_source_directory())
+        layout.addWidget(source_label, row, 0)
+        layout.addWidget(self.source_path_line_edit, row, 1)
+        layout.addWidget(self.source_label_path_button, row, 2)
+        row += 1
+
+        if not self.app.fastflix.config.source_directory:
+            self.default_source_dir.setChecked(True)
+            self.source_path_line_edit.setDisabled(True)
+            self.source_label_path_button.setDisabled(True)
+
+        def in_dir():
+            self.source_path_line_edit.setDisabled(self.source_path_line_edit.isEnabled())
+            self.source_label_path_button.setEnabled(self.source_path_line_edit.isEnabled())
+
+        self.default_source_dir.clicked.connect(in_dir)
+
+        # Spacer
+        layout.setRowStretch(row, 1)
+
+        tab.setLayout(layout)
+        return tab
+
+    def _build_output_naming_tab(self):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        # Template editor
+        template_label = QtWidgets.QLabel(t("Output Filename Template"))
+        template_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(template_label)
+
+        template_row = QtWidgets.QHBoxLayout()
+        self.template_edit = QtWidgets.QLineEdit()
+        self.template_edit.setText(self.app.fastflix.config.output_name_format)
+        self.template_edit.setPlaceholderText("{source}-fastflix-{rand_4}")
+        self.template_edit.textChanged.connect(self._update_template_preview)
+        template_row.addWidget(self.template_edit)
+
+        reset_button = QtWidgets.QPushButton(t("Reset"))
+        reset_button.setFixedWidth(60)
+        reset_button.setToolTip(t("Reset to default template"))
+        reset_button.clicked.connect(lambda: self.template_edit.setText("{source}-fastflix-{rand_4}"))
+        template_row.addWidget(reset_button)
+
+        layout.addLayout(template_row)
+
+        # Live preview
+        preview_header = QtWidgets.QLabel(t("Preview:"))
+        preview_header.setStyleSheet("font-weight: bold; margin-top: 6px;")
+        layout.addWidget(preview_header)
+
+        self.template_preview = QtWidgets.QLabel()
+        self.template_preview.setWordWrap(True)
+        self.template_preview.setStyleSheet("color: #888; padding: 4px;")
+        layout.addWidget(self.template_preview)
+
+        # Validation status
+        self.template_status = QtWidgets.QLabel()
+        layout.addWidget(self.template_status)
+
+        # Pre-encode variable chips
+        pre_header = QtWidgets.QLabel(t("Pre-Encode Variables"))
+        pre_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        layout.addWidget(pre_header)
+
+        self._variable_chips = {}
+        pre_flow = FlowLayout(h_spacing=6, v_spacing=6)
+        pre_container = QtWidgets.QWidget()
+        for var in PRE_ENCODE_VARIABLES:
+            chip = self._make_chip(f"{{{var.name}}}", var.description, var.example, is_post=False)
+            self._variable_chips[var.name] = chip
+            pre_flow.addWidget(chip)
+        pre_container.setLayout(pre_flow)
+        layout.addWidget(pre_container)
+
+        # Post-encode variable chips
+        post_header = QtWidgets.QLabel(t("Post-Encode Variables"))
+        post_header.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        layout.addWidget(post_header)
+        post_subtitle = QtWidgets.QLabel(t("Resolved after encoding completes; file will be renamed automatically"))
+        post_subtitle.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(post_subtitle)
+
+        post_flow = FlowLayout(h_spacing=6, v_spacing=6)
+        post_container = QtWidgets.QWidget()
+        for var in POST_ENCODE_VARIABLES:
+            chip = self._make_chip(f"{{{var.name}}}", var.description, var.example, is_post=True)
+            self._variable_chips[var.name] = chip
+            post_flow.addWidget(chip)
+        post_container.setLayout(post_flow)
+        layout.addWidget(post_container)
+
+        # Variable reference table (always visible)
+        self.ref_table = QtWidgets.QTableWidget()
+        self.ref_table.setColumnCount(4)
+        self.ref_table.setHorizontalHeaderLabels([t("Variable"), t("Description"), t("Phase"), t("Example")])
+        self.ref_table.setRowCount(len(ALL_VARIABLES))
+        self.ref_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.ref_table.horizontalHeader().setStretchLastSection(True)
+        self.ref_table.verticalHeader().setVisible(False)
+        for row, var in enumerate(ALL_VARIABLES):
+            self.ref_table.setItem(row, 0, QtWidgets.QTableWidgetItem(f"{{{var.name}}}"))
+            self.ref_table.setItem(row, 1, QtWidgets.QTableWidgetItem(var.description))
+            phase_text = t("Pre-Encode") if var.phase.value == "pre_encode" else t("Post-Encode")
+            self.ref_table.setItem(row, 2, QtWidgets.QTableWidgetItem(phase_text))
+            self.ref_table.setItem(row, 3, QtWidgets.QTableWidgetItem(var.example))
+        self.ref_table.resizeColumnsToContents()
+        layout.addWidget(self.ref_table)
+
+        # Initialize preview
+        self._update_template_preview()
+
+        tab.setLayout(layout)
+        return tab
+
+    _CHIP_STYLE_PRE = (
+        "QPushButton { background-color: #2a6e9e; color: white; border-radius: 10px; "
+        "padding: 4px 10px; font-size: 12px; border: 1px solid #3a8ebe; }"
+        "QPushButton:hover { background-color: #3a7eae; }"
+    )
+    _CHIP_STYLE_POST = (
+        "QPushButton { background-color: #5b4a8a; color: white; border-radius: 10px; "
+        "padding: 4px 10px; font-size: 12px; border: 1px solid #7a6aaa; }"
+        "QPushButton:hover { background-color: #6b5a9a; }"
+    )
+    _CHIP_STYLE_DISABLED = (
+        "QPushButton { background-color: #555; color: #888; border-radius: 10px; "
+        "padding: 4px 10px; font-size: 12px; border: 1px solid #666; }"
+    )
+
+    def _make_chip(self, text, description, example, is_post=False):
+        """Create a clickable variable chip button."""
+        chip = QtWidgets.QPushButton(text)
+        chip.setToolTip(f"{description}\n{t('Example')}: {example}")
+        chip.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        chip.setProperty("is_post", is_post)
+        chip.setStyleSheet(self._CHIP_STYLE_POST if is_post else self._CHIP_STYLE_PRE)
+        chip.clicked.connect(lambda: self._insert_variable(text))
+        return chip
+
+    def _insert_variable(self, text):
+        """Insert variable text at cursor position in template editor."""
+        cursor_pos = self.template_edit.cursorPosition()
+        current = self.template_edit.text()
+        new_text = current[:cursor_pos] + text + current[cursor_pos:]
+        self.template_edit.setText(new_text)
+        self.template_edit.setCursorPosition(cursor_pos + len(text))
+        self.template_edit.setFocus()
+
+    def _update_template_preview(self):
+        """Update the live preview, validation status, and chip enabled states."""
+        template = self.template_edit.text()
+        is_valid, message = validate_template(template)
+
+        if is_valid:
+            self.template_status.setText(f'<span style="color: green;">\u2714 {message}</span>')
+        else:
+            self.template_status.setText(f'<span style="color: red;">\u2718 {message}</span>')
+
+        preview = generate_preview(template)
+        self.template_preview.setText(preview)
+
+        # Gray out chips for variables already present in the template
+        for var_name, chip in self._variable_chips.items():
+            already_used = f"{{{var_name}}}" in template
+            chip.setEnabled(not already_used)
+            if already_used:
+                chip.setStyleSheet(self._CHIP_STYLE_DISABLED)
+                chip.setCursor(QtGui.QCursor(QtCore.Qt.ForbiddenCursor))
+            else:
+                is_post = chip.property("is_post")
+                chip.setStyleSheet(self._CHIP_STYLE_POST if is_post else self._CHIP_STYLE_PRE)
+                chip.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+
+    def _build_audio_encoders_tab(self):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        description = QtWidgets.QLabel(
+            t("Select which audio encoders appear in audio codec dropdown lists.")
+            + " "
+            + t("Only encoders supported by your FFmpeg build are shown.")
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        # Select All / Deselect All buttons
+        button_row = QtWidgets.QHBoxLayout()
+        select_all_button = QtWidgets.QPushButton(t("Select All"))
+        select_all_button.clicked.connect(lambda: self._set_all_audio_encoders(True))
+        deselect_all_button = QtWidgets.QPushButton(t("Deselect All"))
+        deselect_all_button.clicked.connect(lambda: self._set_all_audio_encoders(False))
+        button_row.addWidget(select_all_button)
+        button_row.addWidget(deselect_all_button)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+
+        # Scrollable list of checkboxes
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_widget = QtWidgets.QWidget()
+        scroll_layout = QtWidgets.QVBoxLayout()
+
+        sane_set = set(self.app.fastflix.config.sane_audio_selection)
+        all_encoders = sorted(self.app.fastflix.audio_encoders or [])
+
+        self.audio_encoder_checkboxes = {}
+        for encoder_name in all_encoders:
+            cb = ToggleSwitch(encoder_name)
+            cb.setChecked(encoder_name in sane_set)
+            self.audio_encoder_checkboxes[encoder_name] = cb
+            scroll_layout.addWidget(cb)
+
+        scroll_layout.addStretch()
+        scroll_widget.setLayout(scroll_layout)
+        scroll_area.setWidget(scroll_widget)
+        layout.addWidget(scroll_area)
+
+        tab.setLayout(layout)
+        return tab
+
+    def _set_all_audio_encoders(self, checked: bool):
+        for cb in self.audio_encoder_checkboxes.values():
+            cb.setChecked(checked)
+
+    def _build_locations_tab(self):
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QGridLayout()
+        layout.setColumnStretch(1, 1)
+        row = 0
+
+        # FFmpeg
+        ffmpeg_label = QtWidgets.QLabel("FFmpeg")
+        self.ffmpeg_path = QtWidgets.QLineEdit()
+        self.ffmpeg_path.setText(str(self.app.fastflix.config.ffmpeg))
+        ffmpeg_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        ffmpeg_path_button.setFixedWidth(30)
+        ffmpeg_path_button.clicked.connect(lambda: self.select_ffmpeg())
+        layout.addWidget(ffmpeg_label, row, 0)
+        layout.addWidget(self.ffmpeg_path, row, 1)
+        layout.addWidget(ffmpeg_path_button, row, 2)
+        row += 1
+
+        # FFprobe
+        ffprobe_label = QtWidgets.QLabel("FFprobe")
+        self.ffprobe_path = QtWidgets.QLineEdit()
+        self.ffprobe_path.setText(str(self.app.fastflix.config.ffprobe))
+        ffprobe_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        ffprobe_path_button.setFixedWidth(30)
+        ffprobe_path_button.clicked.connect(lambda: self.select_ffprobe())
+        layout.addWidget(ffprobe_label, row, 0)
+        layout.addWidget(self.ffprobe_path, row, 1)
+        layout.addWidget(ffprobe_path_button, row, 2)
+        row += 1
+
+        # NVEncC
+        nvencc_label = QtWidgets.QLabel(
+            link("https://github.com/rigaya/NVEnc/releases", "NVEncC", self.app.fastflix.config.theme)
+        )
+        nvencc_label.setOpenExternalLinks(True)
         self.nvencc_path = QtWidgets.QLineEdit()
         if self.app.fastflix.config.nvencc:
             self.nvencc_path.setText(str(self.app.fastflix.config.nvencc))
         nvenc_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        nvenc_path_button.setFixedWidth(30)
         nvenc_path_button.clicked.connect(lambda: self.select_nvencc())
-        layout.addWidget(nvencc_label, 12, 0)
-        layout.addWidget(self.nvencc_path, 12, 1)
-        layout.addWidget(nvenc_path_button, 12, 2)
+        layout.addWidget(nvencc_label, row, 0)
+        layout.addWidget(self.nvencc_path, row, 1)
+        layout.addWidget(nvenc_path_button, row, 2)
+        row += 1
 
-        vceenc_label = QtWidgets.QLabel("VCEEncC")
+        # VCEEncC
+        vceenc_label = QtWidgets.QLabel(
+            link("https://github.com/rigaya/VCEEnc/releases", "VCEEncC", self.app.fastflix.config.theme)
+        )
+        vceenc_label.setOpenExternalLinks(True)
         self.vceenc_path = QtWidgets.QLineEdit()
         if self.app.fastflix.config.vceencc:
             self.vceenc_path.setText(str(self.app.fastflix.config.vceencc))
         vceenc_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        vceenc_path_button.setFixedWidth(30)
         vceenc_path_button.clicked.connect(lambda: self.select_vceenc())
-        layout.addWidget(vceenc_label, 13, 0)
-        layout.addWidget(self.vceenc_path, 13, 1)
-        layout.addWidget(vceenc_path_button, 13, 2)
+        layout.addWidget(vceenc_label, row, 0)
+        layout.addWidget(self.vceenc_path, row, 1)
+        layout.addWidget(vceenc_path_button, row, 2)
+        row += 1
 
-        hdr10_parser_label = QtWidgets.QLabel(t("HDR10+ Parser"))
+        # QSVEncC
+        qsvencc_label = QtWidgets.QLabel(
+            link("https://github.com/rigaya/QSVEnc/releases", "QSVEncC", self.app.fastflix.config.theme)
+        )
+        qsvencc_label.setOpenExternalLinks(True)
+        self.qsvenc_path = QtWidgets.QLineEdit()
+        if self.app.fastflix.config.qsvencc:
+            self.qsvenc_path.setText(str(self.app.fastflix.config.qsvencc))
+        qsvencc_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        qsvencc_path_button.setFixedWidth(30)
+        qsvencc_path_button.clicked.connect(lambda: self.select_qsvencc())
+        layout.addWidget(qsvencc_label, row, 0)
+        layout.addWidget(self.qsvenc_path, row, 1)
+        layout.addWidget(qsvencc_path_button, row, 2)
+        row += 1
+
+        # HDR10+ Parser
+        hdr10_parser_label = QtWidgets.QLabel(
+            link("https://github.com/quietvoid/hdr10plus_tool", "HDR10+ Parser Tool", self.app.fastflix.config.theme)
+        )
+        hdr10_parser_label.setOpenExternalLinks(True)
         self.hdr10_parser_path = QtWidgets.QLineEdit()
         if self.app.fastflix.config.hdr10plus_parser:
             self.hdr10_parser_path.setText(str(self.app.fastflix.config.hdr10plus_parser))
         hdr10_parser_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        hdr10_parser_path_button.setFixedWidth(30)
         hdr10_parser_path_button.clicked.connect(lambda: self.select_hdr10_parser())
-        layout.addWidget(hdr10_parser_label, 14, 0)
-        layout.addWidget(self.hdr10_parser_path, 14, 1)
-        layout.addWidget(hdr10_parser_path_button, 14, 2)
+        layout.addWidget(hdr10_parser_label, row, 0)
+        layout.addWidget(self.hdr10_parser_path, row, 1)
+        layout.addWidget(hdr10_parser_path_button, row, 2)
+        row += 1
 
-        layout.addWidget(self.use_sane_audio, 7, 0, 1, 2)
-        layout.addWidget(self.disable_version_check, 8, 0, 1, 2)
-        layout.addWidget(QtWidgets.QLabel(t("GUI Logging Level")), 9, 0)
-        layout.addWidget(self.logger_level_widget, 9, 1)
-        layout.addWidget(self.flat_ui, 10, 0, 1, 2)
-        layout.addWidget(QtWidgets.QLabel(t("Crop Detect Points")), 11, 0, 1, 1)
-        layout.addWidget(self.crop_detect_points_widget, 11, 1, 1, 1)
+        # gifski
+        gifski_label = QtWidgets.QLabel(link("https://gif.ski/", "gifski", self.app.fastflix.config.theme))
+        gifski_label.setOpenExternalLinks(True)
+        self.gifski_path = QtWidgets.QLineEdit()
+        if self.app.fastflix.config.gifski:
+            self.gifski_path.setText(str(self.app.fastflix.config.gifski))
+        gifski_path_button = QtWidgets.QPushButton(icon=self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        gifski_path_button.setFixedWidth(30)
+        gifski_path_button.clicked.connect(lambda: self.select_gifski())
+        layout.addWidget(gifski_label, row, 0)
+        layout.addWidget(self.gifski_path, row, 1)
+        layout.addWidget(gifski_path_button, row, 2)
+        row += 1
 
-        button_layout = QtWidgets.QHBoxLayout()
-        button_layout.addStretch()
-        button_layout.addWidget(cancel)
-        button_layout.addWidget(save)
+        # Detected External Programs section
+        detected_group = QtWidgets.QGroupBox(t("Detected External Programs"))
+        detected_layout = QtWidgets.QGridLayout()
+        detected_layout.setColumnStretch(1, 1)
 
-        layout.addLayout(button_layout, 16, 0, 1, 3)
+        programs = [
+            (self.app.fastflix.config.nvencc is not None, "NVEncC", t("NVIDIA hardware encoding")),
+            (self.app.fastflix.config.qsvencc is not None, "QSVEncC", t("Intel hardware encoding")),
+            (self.app.fastflix.config.vceencc is not None, "VCEEncC", t("AMD hardware encoding")),
+            (self.app.fastflix.config.hdr10plus_parser is not None, "HDR10+ Parser", t("HDR10+ metadata extraction")),
+            (self.app.fastflix.config.gifski is not None, "gifski", t("High quality GIF encoding")),
+            (self.app.fastflix.config.pgs_ocr_available, "Tesseract + pgsrip", t("PGS subtitle OCR")),
+        ]
 
-        self.setLayout(layout)
+        for det_row, (detected, name, description) in enumerate(programs):
+            icon = "\u2714" if detected else "\u2718"
+            color = "green" if detected else "red"
+            status_label = QtWidgets.QLabel(f'<span style="color: {color};">{icon}</span>')
+            detected_layout.addWidget(status_label, det_row, 0)
+            detected_layout.addWidget(QtWidgets.QLabel(f"<b>{name}</b>"), det_row, 1)
+            detected_layout.addWidget(QtWidgets.QLabel(description), det_row, 2)
+
+        if not self.app.fastflix.config.pgs_ocr_available:
+            ocr_link = QtWidgets.QLabel(
+                link(
+                    "https://github.com/cdgriffith/FastFlix/wiki/PGS-OCR-Setup",
+                    t("PGS OCR setup instructions"),
+                    self.app.fastflix.config.theme,
+                )
+            )
+            ocr_link.setOpenExternalLinks(True)
+            detected_layout.addWidget(ocr_link, len(programs), 0, 1, 3)
+
+        detected_group.setLayout(detected_layout)
+        layout.addWidget(detected_group, row, 0, 1, 3)
+        row += 1
+
+        # Spacer
+        layout.setRowStretch(row, 1)
+
+        tab.setLayout(layout)
+        return tab
 
     def save(self):
         new_ffmpeg = Path(self.ffmpeg_path.text())
         new_ffprobe = Path(self.ffprobe_path.text())
         new_work_dir = Path(self.work_dir.text())
         restart_needed = False
+        encoder_reload_needed = False
         try:
             updated_ffmpeg = self.update_ffmpeg(new_ffmpeg)
+            if updated_ffmpeg:
+                encoder_reload_needed = True
             self.update_ffprobe(new_ffprobe)
         except FastFlixInternalException:
             return
@@ -177,20 +700,33 @@ class Settings(QtWidgets.QWidget):
         try:
             new_work_dir.mkdir(exist_ok=True, parents=True)
         except OSError:
-            error_message(f'{t("Could not create / access work directory")} "{new_work_dir}"')
+            error_message(f'{t("Could not create / access work directory")} "{new_work_dir}"', parent=self)
         else:
             self.app.fastflix.config.work_path = new_work_dir
         self.app.fastflix.config.use_sane_audio = self.use_sane_audio.isChecked()
-        if self.flat_ui.isChecked() != self.app.fastflix.config.flat_ui:
+        self.app.fastflix.config.sane_audio_selection = [
+            name for name, cb in self.audio_encoder_checkboxes.items() if cb.isChecked()
+        ]
+        if self.theme.currentText() != self.app.fastflix.config.theme:
             restart_needed = True
-        self.app.fastflix.config.flat_ui = self.flat_ui.isChecked()
+        self.app.fastflix.config.theme = self.theme.currentText()
 
         old_lang = self.app.fastflix.config.language
+        current_text = self.language_combo.currentText()
         try:
-            self.app.fastflix.config.language = Lang(self.language_combo.currentText()).pt3
+            if current_text == "Chinese (Simplified)":
+                self.app.fastflix.config.language = "chs"
+
+            # reserved for future use
+            # elif current_text != "Chinese (Traditional)":
+            # self.app.fastflix.config.language = "cht"
+
+            else:
+                self.app.fastflix.config.language = Language(self.language_combo.currentText()).pt3
         except InvalidLanguageValue:
             error_message(
-                f"{t('Could not set language to')} {self.language_combo.currentText()}\n {t('Please report this issue')}"
+                f"{t('Could not set language to')} {self.language_combo.currentText()}\n {t('Please report this issue')}",
+                parent=self,
             )
         self.app.fastflix.config.disable_version_check = self.disable_version_check.isChecked()
         log_level = (self.logger_level_widget.currentIndex() + 1) * 10
@@ -198,62 +734,193 @@ class Settings(QtWidgets.QWidget):
         logger.setLevel(log_level)
         self.app.fastflix.config.crop_detect_points = int(self.crop_detect_points_widget.currentText())
 
-        new_nvencc = Path(self.nvencc_path.text()) if self.nvencc_path.text() else None
-        if self.app.fastflix.config.nvencc != new_nvencc:
-            restart_needed = True
+        new_nvencc = Path(self.nvencc_path.text()) if self.nvencc_path.text().strip() else None
+        if str(self.app.fastflix.config.nvencc) != str(new_nvencc):
+            encoder_reload_needed = True
         self.app.fastflix.config.nvencc = new_nvencc
 
-        new_vce = Path(self.vceenc_path.text()) if self.vceenc_path.text() else None
-        if self.app.fastflix.config.vceencc != new_vce:
-            restart_needed = True
+        new_qsvencc = Path(self.qsvenc_path.text()) if self.qsvenc_path.text().strip() else None
+        if str(self.app.fastflix.config.qsvencc) != str(new_qsvencc):
+            encoder_reload_needed = True
+        self.app.fastflix.config.qsvencc = new_qsvencc
+
+        new_vce = Path(self.vceenc_path.text()) if self.vceenc_path.text().strip() else None
+        if str(self.app.fastflix.config.vceencc) != str(new_vce):
+            encoder_reload_needed = True
         self.app.fastflix.config.vceencc = new_vce
 
-        new_hdr10_parser = Path(self.hdr10_parser_path.text()) if self.hdr10_parser_path.text() else None
-        if self.app.fastflix.config.hdr10plus_parser != new_hdr10_parser:
-            restart_needed = True
+        new_hdr10_parser = Path(self.hdr10_parser_path.text()) if self.hdr10_parser_path.text().strip() else None
+        if str(self.app.fastflix.config.hdr10plus_parser) != str(new_hdr10_parser):
+            encoder_reload_needed = True
         self.app.fastflix.config.hdr10plus_parser = new_hdr10_parser
 
-        self.main.config_update()
+        new_gifski = Path(self.gifski_path.text()) if self.gifski_path.text().strip() else None
+        if str(self.app.fastflix.config.gifski) != str(new_gifski):
+            encoder_reload_needed = True
+        self.app.fastflix.config.gifski = new_gifski
+
+        new_output_path = None
+        if self.output_path_line_edit.text().strip() and not self.default_output_dir.isChecked():
+            new_output_path = Path(self.output_path_line_edit.text())
+        self.app.fastflix.config.output_directory = new_output_path
+
+        new_source_path = None
+        if self.source_path_line_edit.text().strip() and not self.default_source_dir.isChecked():
+            new_source_path = Path(self.source_path_line_edit.text())
+        self.app.fastflix.config.source_directory = new_source_path
+
+        old_scale = self.app.fastflix.config.ui_scale
+        self.app.fastflix.config.ui_scale = scale_digits[scale_percents.index(self.ui_scale_widget.currentText())]
+        if self.app.fastflix.config.ui_scale != old_scale:
+            restart_needed = True
+
+        # Output naming template
+        new_template = self.template_edit.text().strip()
+        if new_template:
+            is_valid, msg = validate_template(new_template)
+            if not is_valid:
+                error_message(f"{t('Invalid output naming template')}: {msg}", parent=self)
+                return
+            self.app.fastflix.config.output_name_format = new_template
+        else:
+            self.app.fastflix.config.output_name_format = "{source}-fastflix-{rand_4}"
+
+        self.app.fastflix.config.clean_old_logs = self.clean_old_logs_button.isChecked()
+        self.app.fastflix.config.sticky_tabs = self.sticky_tabs.isChecked()
+        self.app.fastflix.config.show_complete_message = self.show_complete_message.isChecked()
+        self.app.fastflix.config.play_complete_sound = self.play_complete_sound.isChecked()
+        self.app.fastflix.config.show_error_message = self.show_error_message.isChecked()
+        self.app.fastflix.config.keep_source_after_encode = self.keep_source_after_encode.isChecked()
+        self.app.fastflix.config.disable_deinterlace_check = self.disable_deinterlace_button.isChecked()
+        self.app.fastflix.config.suppress_ffmpeg_version_warning = self.suppress_ffmpeg_version_warning.isChecked()
+        self.app.fastflix.config.use_keyframes_for_preview = self.use_keyframes_for_preview.isChecked()
+        self.app.fastflix.config.auto_detect_subtitles = self.auto_detect_subtitles.isChecked()
+
+        new_history = self.enable_history.isChecked()
+        old_history = bool(self.app.fastflix.config.enable_history)
+        if old_history and not new_history:
+            from fastflix.models.history import clear_history
+
+            if yes_no_message(
+                t("Would you like to delete your encoding history data?"),
+                title=t("Delete History"),
+            ):
+                clear_history(self.app.fastflix.data_path)
+        self.app.fastflix.config.enable_history = new_history
+
+        if self.opencl_combo.currentIndex() == 1:  # Disable
+            self.app.fastflix.config.opencl_support = False
+            self.app.fastflix.opencl_support = False
+        else:  # Auto
+            self._run_opencl_detection()
+            self.app.fastflix.config.opencl_support = None
+
+        self.main.config_update(encoder_reload_needed=encoder_reload_needed)
         self.app.fastflix.config.save()
-        if updated_ffmpeg or old_lang != self.app.fastflix.config.language or restart_needed:
-            error_message(t("Please restart FastFlix to apply settings"))
+        if old_lang != self.app.fastflix.config.language or restart_needed:
+            error_message(t("Please restart FastFlix to apply settings"), parent=self)
         self.close()
 
     def select_ffmpeg(self):
         dirname = Path(self.ffmpeg_path.text()).parent
         if not dirname.exists():
             dirname = Path()
-        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="FFmepg location", directory=str(dirname))
+        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="FFmepg location", dir=str(dirname))
         if not filename or not filename[0]:
             return
-        self.ffmpeg_path.setText(filename[0])
+        self.ffmpeg_path.setText(str(Path(filename[0]).absolute()))
 
     def select_nvencc(self):
         dirname = Path(self.nvencc_path.text()).parent
         if not dirname.exists():
             dirname = Path()
-        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="NVEncC location", directory=str(dirname))
+        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="NVEncC location", dir=str(dirname))
         if not filename or not filename[0]:
             return
-        self.nvencc_path.setText(filename[0])
+        self.nvencc_path.setText(str(Path(filename[0]).absolute()))
+
+    def select_qsvencc(self):
+        dirname = Path(self.qsvenc_path.text()).parent
+        if not dirname.exists():
+            dirname = Path()
+        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="QSVEncC location", dir=str(dirname))
+        if not filename or not filename[0]:
+            return
+        self.qsvenc_path.setText(str(Path(filename[0]).absolute()))
 
     def select_vceenc(self):
         dirname = Path(self.vceenc_path.text()).parent
         if not dirname.exists():
             dirname = Path()
-        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="VCEEncC location", directory=str(dirname))
+        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="VCEEncC location", dir=str(dirname))
         if not filename or not filename[0]:
             return
-        self.vceenc_path.setText(filename[0])
+        self.vceenc_path.setText(str(Path(filename[0]).absolute()))
 
     def select_hdr10_parser(self):
         dirname = Path(self.hdr10_parser_path.text()).parent
         if not dirname.exists():
             dirname = Path()
-        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="hdr10+ parser", directory=str(dirname))
+        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="hdr10+ parser", dir=str(dirname))
         if not filename or not filename[0]:
             return
-        self.hdr10_parser_path.setText(filename[0])
+        self.hdr10_parser_path.setText(str(Path(filename[0]).absolute()))
+
+    def select_gifski(self):
+        dirname = Path(self.gifski_path.text()).parent
+        if not dirname.exists():
+            dirname = Path()
+        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="gifski location", dir=str(dirname))
+        if not filename or not filename[0]:
+            return
+        self.gifski_path.setText(str(Path(filename[0]).absolute()))
+
+    def _update_opencl_status(self):
+        """Update the OpenCL status icon based on current detection state."""
+        if self.opencl_combo.currentIndex() == 1:  # Disable
+            self.opencl_status_label.setText("")
+        elif self.app.fastflix.opencl_support:
+            self.opencl_status_label.setText('<span style="color: green;">\u2714</span>')
+        else:
+            self.opencl_status_label.setText('<span style="color: red;">\u2718</span>')
+
+    def _run_opencl_detection(self):
+        """Run OpenCL detection using FFmpeg and update the status icon."""
+        from fastflix.flix import execute
+
+        cmd = execute(
+            [
+                str(self.app.fastflix.config.ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-init_hw_device",
+                "opencl:0.0",
+                "-h",
+            ]
+        )
+        detected = cmd.returncode == 0
+        self.app.fastflix.opencl_support = detected
+        self._update_opencl_status()
+        logger.info(f"OpenCL re-detection result: {'supported' if detected else 'not supported'}")
+
+    def select_output_directory(self):
+        dirname = Path(self.output_path_line_edit.text()).parent
+        if not dirname.exists():
+            dirname = Path()
+        filename = QtWidgets.QFileDialog.getExistingDirectory(self, caption="Output Directory", dir=str(dirname))
+        if not filename:
+            return
+        self.output_path_line_edit.setText(filename)
+
+    def select_source_directory(self):
+        dirname = Path(self.source_path_line_edit.text()).parent
+        if not dirname.exists():
+            dirname = Path()
+        filename = QtWidgets.QFileDialog.getExistingDirectory(self, caption="Source Directory", dir=str(dirname))
+        if not filename:
+            return
+        self.source_path_line_edit.setText(filename)
 
     @staticmethod
     def path_check(name, new_path):
@@ -280,7 +947,7 @@ class Settings(QtWidgets.QWidget):
         dirname = Path(self.ffprobe_path.text()).parent
         if not dirname.exists():
             dirname = Path()
-        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="FFprobe location", directory=str(dirname))
+        filename = QtWidgets.QFileDialog.getOpenFileName(self, caption="FFprobe location", dir=str(dirname))
         if not filename or not filename[0]:
             return
         self.ffprobe_path.setText(filename[0])
@@ -298,9 +965,9 @@ class Settings(QtWidgets.QWidget):
         if not dirname.exists():
             dirname = Path()
         dialog = QtWidgets.QFileDialog()
-        dialog.setFileMode(QtWidgets.QFileDialog.DirectoryOnly)
+        dialog.setFileMode(QtWidgets.QFileDialog.Directory)
         dialog.setOption(QtWidgets.QFileDialog.ShowDirsOnly)
-        work_path = dialog.getExistingDirectory(directory=str(dirname), caption="Work directory")
+        work_path = dialog.getExistingDirectory(dir=str(dirname), caption="Work directory")
         if not work_path:
             return
         self.work_dir.setText(work_path)

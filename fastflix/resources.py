@@ -1,41 +1,105 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
+import os
+import sys
+from functools import lru_cache
 
-import pkg_resources
+import importlib.resources
 
-main_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icon.ico")).resolve())
-language_file = str(Path(pkg_resources.resource_filename(__name__, "data/languages.yaml")).resolve())
-default_mode = Path(pkg_resources.resource_filename(__name__, "data/styles/default.qss")).resolve().read_text()
+ref = importlib.resources.files("fastflix") / "data/icon.ico"
+with importlib.resources.as_file(ref) as icon_file:
+    main_icon = str(icon_file.resolve())
 
-
-changes_file = Path(pkg_resources.resource_filename(__name__, "CHANGES")).resolve()
+ref = importlib.resources.files("fastflix") / "CHANGES"
+with importlib.resources.as_file(ref) as cf:
+    changes_file = cf.resolve()
 local_changes_file = Path(__file__).parent.parent / "CHANGES"
+local_package_changes_file = Path(__file__).parent / "CHANGES"
+
+ref = importlib.resources.files("fastflix") / "data/icons/loading.gif"
+with importlib.resources.as_file(ref) as icon_file:
+    loading_movie = str(icon_file.resolve())
+
+ref = importlib.resources.files("fastflix") / "data/icons/onyx-convert.svg"
+with importlib.resources.as_file(ref) as icon_file:
+    onyx_convert_icon = str(icon_file.resolve())
+
+ref = importlib.resources.files("fastflix") / "data/icons/onyx-add-queue.svg"
+with importlib.resources.as_file(ref) as icon_file:
+    onyx_queue_add_icon = str(icon_file.resolve())
+
+ref = importlib.resources.files("fastflix") / "data/styles/breeze_styles"
+with importlib.resources.as_file(ref) as bf:
+    breeze_styles_path = bf.resolve()
 
 
-video_add_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/video-add.png")).resolve())
-video_playlist_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/video-playlist.png")).resolve())
-play_round_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/play-round.png")).resolve())
-cinema_film_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/cinema-film.png")).resolve())
-video_delete_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/video-delete.png")).resolve())
-black_x_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/black-x.png")).resolve())
-up_arrow_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/up-arrow.png")).resolve())
-down_arrow_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/down-arrow.png")).resolve())
-settings_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/setting.png")).resolve())
-folder_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/folder.png")).resolve())
-play_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/play.png")).resolve())
-profile_add_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/text-document-add.png")).resolve())
-edit_box_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/edit-box.png")).resolve())
-copy_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/copy.png")).resolve())
-warning_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/warning-triangle.png")).resolve())
-editing_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/video-editing.png")).resolve())
-photo_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/photo.png")).resolve())
-cc_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/closed-caption-subtitles.png")).resolve())
-music_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/music.png")).resolve())
-text_left_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/text-align-left.png")).resolve())
-poll_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/poll.png")).resolve())
-working_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/pending-work.png")).resolve())
-advanced_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/advanced.png")).resolve())
-info_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/info.png")).resolve())
-undo_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/undo-arrow.png")).resolve())
-loading_movie = str(Path(pkg_resources.resource_filename(__name__, "data/icons/loading.gif")).resolve())
-magnifier_icon = str(Path(pkg_resources.resource_filename(__name__, "data/icons/magnifier-glass-zoom.png")).resolve())
+# fmt: off
+video_file_types = ('.mkv', '.mp4', '.m4v', '.mov', '.avi', '.divx', '.webm', '.mpg', '.mp2', '.mpeg', '.mpe', '.mpv',
+                    '.ogg', '.m4p', '.wmv', '.mov', '.qt', '.flv', '.hevc', '.gif', '.webp', '.vob', '.ogv', '.ts',
+                    '.mts', '.m2ts', '.yuv', '.rm', '.svi', '.3gp', '.3g2', '.y4m')
+# fmt: on
+
+
+@lru_cache()
+def get_icon(name: str, theme: str):
+    folder = "black"
+    if theme.lower() in ("dark", "onyx"):
+        folder = "white"
+    if theme == "selected":  # Used for bright tab colors
+        folder = "selected"
+
+    ref = importlib.resources.files("fastflix") / f"data/icons/{folder}/{name}.svg"
+    with importlib.resources.as_file(ref) as icon_file:
+        location = icon_file.resolve()
+
+    if not location.exists():
+        ref = importlib.resources.files("fastflix") / f"data/icons/{folder}/{name}.png"
+        with importlib.resources.as_file(ref) as icon_file:
+            location = icon_file.resolve()
+
+    if not location.exists():
+        raise Exception(f"Cannot find: {location}")
+    return str(location)
+
+
+def get_text_color(theme: str):
+    if theme.lower() in ("dark", "onyx"):
+        return "255, 255, 255"
+    return "0, 0, 0"
+
+
+def group_box_style(pt="-10px", pb="5px", mt="5px", mb="0", bb="1px solid #bab9b8"):
+    return (
+        f"QGroupBox{{padding-top: {pt}; padding-bottom: {pb}; margin-bottom: {mb}; "
+        f"margin-top: {mt}; border: none; border-bottom: {bb}; border-radius: 0; }}"
+    )
+
+
+reset_button_style = "QPushButton{border: none; margin-left: 0; padding-left: 0; margin-top: 0;}"
+
+
+def get_bool_env(variable: str):
+    var = os.getenv(variable, "")
+    if not var:
+        return False
+    if var.lower() in ("1", "on", "yes", "true", "t"):
+        return True
+    return False
+
+
+def clean_env() -> dict:
+    """Return a copy of os.environ that is safe for launching external tools (FFmpeg, FFprobe, rigaya, etc).
+
+    A PyInstaller onefile build points LD_LIBRARY_PATH at its bundled libraries, so system binaries such as
+    /usr/bin/ffmpeg would load those (e.g. an incompatible libass) instead of the system ones. PyInstaller keeps
+    the user's original value in LD_LIBRARY_PATH_ORIG, which is restored here (or the variable is removed).
+    Kept in this Qt-free module so the conversion worker process can use it without importing PySide6.
+    """
+    env = os.environ.copy()
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        original = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if original is not None:
+            env["LD_LIBRARY_PATH"] = original
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env

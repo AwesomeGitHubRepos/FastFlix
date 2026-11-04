@@ -2,66 +2,184 @@
 # -*- coding: utf-8 -*-
 import copy
 import logging
+from typing import TYPE_CHECKING
 
-from qtpy import QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastflix.language import t
 from fastflix.models.fastflix_app import FastFlixApp
-from fastflix.resources import (
-    advanced_icon,
-    cc_icon,
-    editing_icon,
-    info_icon,
-    music_icon,
-    photo_icon,
-    poll_icon,
-    text_left_icon,
-    working_icon,
-)
-from fastflix.shared import DEVMODE
+from fastflix.resources import get_icon
+from fastflix.ui_constants import FONTS
+from fastflix.ui_scale import scaler
+from fastflix.ui_styles import ONYX_COLORS, get_onyx_combobox_style
+from fastflix.shared import DEVMODE, error_message
 from fastflix.widgets.panels.advanced_panel import AdvancedPanel
 from fastflix.widgets.panels.audio_panel import AudioList
 from fastflix.widgets.panels.command_panel import CommandList
 from fastflix.widgets.panels.cover_panel import CoverPanel
+from fastflix.widgets.panels.data_panel import DataList
 from fastflix.widgets.panels.debug_panel import DebugPanel
 from fastflix.widgets.panels.info_panel import InfoPanel
 from fastflix.widgets.panels.queue_panel import EncodingQueue
 from fastflix.widgets.panels.status_panel import StatusPanel
 from fastflix.widgets.panels.subtitle_panel import SubtitleList
 
+if TYPE_CHECKING:
+    from fastflix.widgets.main import Main
+
 logger = logging.getLogger("fastflix")
+
+icons = {
+    0: "onyx-quality",
+    1: "onyx-audio",
+    2: "onyx-cc",
+    3: "onyx-data",
+    4: "onyx-cover",
+    5: "onyx-advanced",
+    6: "onyx-source-details",
+    7: "onyx-raw-commands",
+    8: "onyx-status",
+    9: "onyx-queue",
+    10: "info",
+}
+
+
+class ScrollableTabBar(QtWidgets.QTabBar):
+    """Custom tab bar that positions scroll buttons at far left and far right."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setElideMode(QtCore.Qt.ElideRight)
+        self._left_btn = None
+        self._right_btn = None
+
+    def _find_scroll_buttons(self):
+        if self._left_btn and self._right_btn:
+            return
+        for child in self.findChildren(QtWidgets.QToolButton):
+            if child.arrowType() == QtCore.Qt.LeftArrow:
+                self._left_btn = child
+            elif child.arrowType() == QtCore.Qt.RightArrow:
+                self._right_btn = child
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._find_scroll_buttons()
+        btn_size = max(28, self.height())
+        if self._left_btn and self._left_btn.isVisible():
+            self._left_btn.setFixedSize(btn_size, self.height())
+            self._left_btn.move(0, 0)
+            self._left_btn.raise_()
+        if self._right_btn and self._right_btn.isVisible():
+            self._right_btn.setFixedSize(btn_size, self.height())
+            self._right_btn.move(self.width() - btn_size, 0)
+            self._right_btn.raise_()
 
 
 class VideoOptions(QtWidgets.QTabWidget):
     def __init__(self, parent, app: FastFlixApp, available_audio_encoders):
         super().__init__(parent)
-        self.main = parent
+        self.main: "Main" = parent
         self.app = app
+
+        # Install custom tab bar with better scroll buttons
+        custom_tab_bar = ScrollableTabBar(self)
+        self.setTabBar(custom_tab_bar)
+
+        self.reloading = False
 
         self.selected = 0
         self.commands = CommandList(self, self.app)
-        self.current_settings = self.main.current_encoder.settings_panel(self, self.main, self.app)
-
+        encoder = self.main.current_encoder
+        if encoder:
+            self.current_settings = encoder.settings_panel(self, self.main, self.app)
+        else:
+            self.current_settings = QtWidgets.QWidget(self)
+        self.tabBar().tabBarClicked.connect(self.change_tab)
         self.audio = AudioList(self, self.app)
         self.subtitles = SubtitleList(self, self.app)
+        self.data = DataList(self, self.app)
         self.status = StatusPanel(self, self.app)
         self.attachments = CoverPanel(self, self.app)
         self.queue = EncodingQueue(self, self.app)
         self.advanced = AdvancedPanel(self, self.app)
         self.info = InfoPanel(self, self.app)
         self.debug = DebugPanel(self, self.app)
+        scroll_btn_size = max(28, self.tabBar().height())
+        scroll_btn_font_pt = max(6, round(scaler.scale_font(FONTS.XLARGE) * 0.75))
+        tab_font_pt = max(6, round(scaler.scale_font(FONTS.LARGE) * 0.75))
+        scroll_btn_style = (
+            f"QTabBar QToolButton{{ min-width: {scroll_btn_size}px; min-height: {scroll_btn_size}px; "
+            f"font-size: {scroll_btn_font_pt}pt; font-weight: bold; }}"
+        )
+        if self.app.fastflix.config.theme == "onyx":
+            self.setStyleSheet(
+                f"QTabBar{{ font-size: {tab_font_pt}pt; }} "
+                "QTabBar::tab{ border-top: 2px solid transparent; } "
+                f"QTabBar::tab:selected{{ border-top: 2px solid {ONYX_COLORS['primary']}; }} "
+                "QLineEdit{ color: white; border-radius: 5px; min-height: 1.1em; } "
+                "QTextEdit{ color: white; } "
+                "QPlainTextEdit{ color: white; } "
+                f"QComboBox{{ min-height: 1.1em; border-radius: 5px; {get_onyx_combobox_style()} }}"
+                "QComboBox:hover{ background-color: #6a8a96; } "
+                f"QComboBox QAbstractItemView{{ background-color: {ONYX_COLORS['dark_bg']}; border: 2px solid {ONYX_COLORS['input_bg']}; }} "
+                + scroll_btn_style
+            )
+        else:
+            self.setStyleSheet(scroll_btn_style)
 
-        self.addTab(self.current_settings, QtGui.QIcon(editing_icon), t("Quality"))
-        self.addTab(self.audio, QtGui.QIcon(music_icon), t("Audio"))
-        self.addTab(self.subtitles, QtGui.QIcon(cc_icon), t("Subtitles"))
-        self.addTab(self.attachments, QtGui.QIcon(photo_icon), t("Cover"))
-        self.addTab(self.advanced, QtGui.QIcon(advanced_icon), t("Advanced"))
-        self.addTab(self.info, QtGui.QIcon(info_icon), t("Source Details"))
-        self.addTab(self.commands, QtGui.QIcon(text_left_icon), t("Raw Commands"))
-        self.addTab(self.status, QtGui.QIcon(working_icon), t("Encoding Status"))
-        self.addTab(self.queue, QtGui.QIcon(poll_icon), t("Encoding Queue"))
+        self.setIconSize(scaler.scale_size(20, 20))
+        self.addTab(
+            self.current_settings, QtGui.QIcon(get_icon("onyx-quality", app.fastflix.config.theme)), t("Quality")
+        )
+        self.addTab(self.audio, QtGui.QIcon(get_icon("onyx-audio", app.fastflix.config.theme)), t("Audio"))
+        self.addTab(self.subtitles, QtGui.QIcon(get_icon("onyx-cc", app.fastflix.config.theme)), t("Subtitles"))
+        self.addTab(self.data, QtGui.QIcon(get_icon("onyx-data", app.fastflix.config.theme)), t("Data"))
+        self.addTab(self.attachments, QtGui.QIcon(get_icon("onyx-cover", app.fastflix.config.theme)), t("Cover"))
+        self.addTab(self.advanced, QtGui.QIcon(get_icon("onyx-advanced", app.fastflix.config.theme)), t("Advanced"))
+        self.addTab(
+            self.info, QtGui.QIcon(get_icon("onyx-source-details", app.fastflix.config.theme)), t("Source Details")
+        )
+        self.addTab(
+            self.commands, QtGui.QIcon(get_icon("onyx-raw-commands", app.fastflix.config.theme)), t("Raw Commands")
+        )
+        self.addTab(self.status, QtGui.QIcon(get_icon("onyx-status", app.fastflix.config.theme)), t("Encoding Status"))
+        self.addTab(self.queue, QtGui.QIcon(get_icon("onyx-queue", app.fastflix.config.theme)), t("Encoding Queue"))
         if DEVMODE:
-            self.addTab(self.debug, QtGui.QIcon(info_icon), "Debug")
+            self.addTab(self.debug, QtGui.QIcon(get_icon("info", app.fastflix.config.theme)), "Debug")
+
+        # Add separator line below tabs for onyx theme
+        self.tab_separator = None
+        if self.app.fastflix.config.theme == "onyx":
+            self.tab_separator = QtWidgets.QFrame(self)
+            self.tab_separator.setFrameShape(QtWidgets.QFrame.HLine)
+            self.tab_separator.setFixedHeight(3)
+            self.tab_separator.setStyleSheet(f"background-color: {ONYX_COLORS['primary']};")
+            self.tab_separator.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+            self.tab_separator.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.tab_separator:
+            # Position the separator right below the tab bar
+            tab_bar_height = self.tabBar().height()
+            self.tab_separator.setGeometry(0, tab_bar_height, self.width(), 3)
+
+    def resetTabIcons(self):
+        for index, icon_name in icons.items():
+            self.setTabIcon(index, QtGui.QIcon(get_icon(icon_name, self.app.fastflix.config.theme)))
+
+    def change_tab(self, index):
+        if index == -1:
+            return
+        self.resetTabIcons()
+        self.setTabIcon(index, QtGui.QIcon(get_icon(icons[index], "selected")))
+
+    def paintEvent(self, event):
+        o = QtWidgets.QStyleOption()
+        o.initFrom(self)
+        p = QtGui.QPainter(self)
+        self.style().drawPrimitive(QtWidgets.QStyle.PE_Widget, o, p, self)
 
     def _get_audio_formats(self, encoder=None):
         encoders = None
@@ -80,53 +198,101 @@ class VideoOptions(QtWidgets.QTabWidget):
     def audio_formats(self):
         return self._get_audio_formats()
 
-    def change_conversion(self, conversion):
+    def change_conversion(self, conversion, previous_encoder_no_audio=False):
         conversion = conversion.strip()
-        encoder = self.app.fastflix.encoders[conversion]
+        if not conversion or not self.app.fastflix.encoders:
+            return
+        encoder = self.app.fastflix.encoders.get(conversion)
+        if encoder is None:
+            logger.warning(f"Encoder '{conversion}' not found in available encoders")
+            return
         self.current_settings.close()
         self.current_settings = encoder.settings_panel(self, self.main, self.app)
         self.current_settings.show()
+
+        index = self.currentIndex()
         self.removeTab(0)
         self.insertTab(0, self.current_settings, t("Quality"))
-        self.setTabIcon(0, QtGui.QIcon(editing_icon))
-        self.setCurrentIndex(0)
+        self.setTabIcon(0, QtGui.QIcon(get_icon("onyx-quality", self.app.fastflix.config.theme)))
+
+        if not self.app.fastflix.config.sticky_tabs:
+            self.setCurrentIndex(0)
+            self.change_tab(0)
+        else:
+            self.setCurrentIndex(index)
         self.setTabEnabled(1, getattr(encoder, "enable_audio", True))
         self.setTabEnabled(2, getattr(encoder, "enable_subtitles", True))
-        self.setTabEnabled(3, getattr(encoder, "enable_attachments", True))
+        self.setTabEnabled(3, getattr(encoder, "enable_data", False))
+        self.setTabEnabled(4, getattr(encoder, "enable_attachments", True))
+        self.setTabEnabled(5, getattr(encoder, "enable_advanced", True))
+        self.setTabVisible(1, getattr(encoder, "enable_audio", True))
+        self.setTabVisible(2, getattr(encoder, "enable_subtitles", True))
+        self.setTabVisible(3, getattr(encoder, "enable_data", False))
+        self.setTabVisible(4, getattr(encoder, "enable_attachments", True))
+        self.setTabVisible(5, getattr(encoder, "enable_advanced", True))
         self.selected = conversion
         self.current_settings.new_source()
         self.main.page_update(build_thumbnail=False)
+        if (
+            self.app.fastflix.current_video
+            and not getattr(self.main.current_encoder, "enable_concat", False)
+            and self.app.fastflix.current_video.concat
+        ):
+            error_message(
+                f"This encoder, {self.main.current_encoder.name} does not support concatenating files together"
+            )
+        if previous_encoder_no_audio:
+            self.audio.new_source(self.audio_formats)
         # Page update does a reload which bases itself off the current encoder so we have to do audio formats after
-        self.audio.allowed_formats(self._get_audio_formats(encoder))
+        if not self.reloading:
+            self.audio.allowed_formats(self._get_audio_formats(encoder))
+            # self.update_profile()
+        # Ensure window stays within screen bounds after encoder change
+        self.main.container.ensure_window_in_bounds()
 
     def get_settings(self):
         if not self.app.fastflix.current_video:
             return
+
+        try:
+            del self.app.fastflix.current_video.video_settings.video_encoder_settings
+        except (KeyError, AttributeError):
+            pass
         self.current_settings.update_video_encoder_settings()
 
         if getattr(self.main.current_encoder, "enable_audio", False):
             self.audio.update_audio_settings()
-        if getattr(self.main.current_encoder, "enable_subtitles", False):
-            self.subtitles.get_settings()
+        if getattr(self.main.current_encoder, "enable_data", False):
+            self.data.get_settings()
         if getattr(self.main.current_encoder, "enable_attachments", False):
             self.attachments.update_cover_settings()
 
         self.advanced.update_settings()
-        self.main.container.profile.update_settings()
 
     def new_source(self):
         if not self.app.fastflix.current_video:
             return
+        profile = self.app.fastflix.config.profiles[self.app.fastflix.config.selected_profile]
         if getattr(self.main.current_encoder, "enable_audio", False):
             self.audio.new_source(self.audio_formats)
+            streams = copy.deepcopy(self.app.fastflix.current_video.streams)
+            self.audio.apply_profile_settings(
+                profile,
+                streams.audio,
+                self.audio_formats,
+                og_only=getattr(self.main.current_encoder, "original_audio_tracks_only", False),
+            )
         if getattr(self.main.current_encoder, "enable_subtitles", False):
             self.subtitles.new_source()
+        if getattr(self.main.current_encoder, "enable_data", False):
+            self.data.new_source()
+            self.data.apply_profile_settings(profile)
         if getattr(self.main.current_encoder, "enable_attachments", False):
             self.attachments.new_source(self.app.fastflix.current_video.streams.attachment)
         self.current_settings.new_source()
         self.queue.new_source()
         self.advanced.new_source()
-        self.main.container.profile.update_settings()
+        # TODO disable on loading from directory
         self.info.reset()
         self.debug.reset()
 
@@ -135,28 +301,51 @@ class VideoOptions(QtWidgets.QTabWidget):
             self.audio.refresh()
         if getattr(self.main.current_encoder, "enable_subtitles", False):
             self.subtitles.refresh()
+        if getattr(self.main.current_encoder, "enable_data", False):
+            self.data.refresh()
         self.advanced.update_settings()
-        self.main.container.profile.update_settings()
+        # self.main.container.profile.update_settings()
 
     def update_profile(self):
+        if not hasattr(self.current_settings, "update_profile"):
+            return
         self.current_settings.update_profile()
         if self.app.fastflix.current_video:
+            streams = copy.deepcopy(self.app.fastflix.current_video.streams)
+            # settings = copy.deepcopy(self.app.fastflix.current_video.video_settings)
+            # audio_tracks = settings.audio_tracks
+            # subtitle_tracks = settings.subtitle_tracks
+            profile = self.app.fastflix.config.profile
+
             if getattr(self.main.current_encoder, "enable_audio", False):
+                self.audio.apply_profile_settings(
+                    profile,
+                    streams.audio,
+                    self.audio_formats,
+                    og_only=getattr(self.main.current_encoder, "original_audio_tracks_only", False),
+                )
                 self.audio.update_audio_settings()
             if getattr(self.main.current_encoder, "enable_subtitles", False):
-                self.subtitles.get_settings()
+                self.subtitles.apply_profile_settings()
+            if getattr(self.main.current_encoder, "enable_data", False):
+                self.data.apply_profile_settings(profile)
             if getattr(self.main.current_encoder, "enable_attachments", False):
                 self.attachments.update_cover_settings()
         self.advanced.update_settings()
-        self.main.container.profile.update_settings()
+        # self.main.container.profile.update_settings()
 
     def reload(self):
-        self.change_conversion(self.app.fastflix.current_video.video_settings.video_encoder_settings.name)
-        self.main.widgets.convert_to.setCurrentIndex(
-            list(self.app.fastflix.encoders.keys()).index(
-                self.app.fastflix.current_video.video_settings.video_encoder_settings.name
-            )
-        )
+        self.reloading = True
+        try:
+            encoder_name = self.app.fastflix.current_video.video_settings.video_encoder_settings.name
+            if encoder_name not in self.app.fastflix.encoders:
+                logger.warning(f"Encoder '{encoder_name}' not found during reload, skipping")
+                return
+            self.change_conversion(encoder_name)
+            encoder_keys = list(self.app.fastflix.encoders.keys())
+            self.main.widgets.convert_to.setCurrentIndex(encoder_keys.index(encoder_name))
+        finally:
+            self.reloading = False
         try:
             self.current_settings.reload()
         except Exception:
@@ -165,15 +354,19 @@ class VideoOptions(QtWidgets.QTabWidget):
         if self.app.fastflix.current_video:
             streams = copy.deepcopy(self.app.fastflix.current_video.streams)
             settings = copy.deepcopy(self.app.fastflix.current_video.video_settings)
-            audio_tracks = settings.audio_tracks
-            subtitle_tracks = settings.subtitle_tracks
+            audio_tracks = copy.deepcopy(self.app.fastflix.current_video.audio_tracks or [])
+            subtitle_tracks = copy.deepcopy(self.app.fastflix.current_video.subtitle_tracks or [])
+            attachment_tracks = copy.deepcopy(self.app.fastflix.current_video.attachment_tracks or [])
+            data_tracks = copy.deepcopy(self.app.fastflix.current_video.data_tracks or [])
             try:
                 if getattr(self.main.current_encoder, "enable_audio", False):
                     self.audio.reload(audio_tracks, self.audio_formats)
                 if getattr(self.main.current_encoder, "enable_subtitles", False):
                     self.subtitles.reload(subtitle_tracks)
+                if getattr(self.main.current_encoder, "enable_data", False):
+                    self.data.reload(data_tracks)
                 if getattr(self.main.current_encoder, "enable_attachments", False):
-                    self.attachments.reload_from_queue(streams, settings)
+                    self.attachments.reload_from_queue(streams, attachment_tracks)
                 self.advanced.reset(settings=settings)
                 self.info.reset()
             except Exception:
@@ -182,9 +375,10 @@ class VideoOptions(QtWidgets.QTabWidget):
         self.debug.reset()
 
     def clear_tracks(self):
-        self.current_settings.update_profile()
+        # self.current_settings.update_profile()
         self.audio.remove_all()
         self.subtitles.remove_all()
+        self.data.remove_all()
         self.attachments.clear_covers()
         self.commands.update_commands([])
         self.advanced.reset()
@@ -195,10 +389,12 @@ class VideoOptions(QtWidgets.QTabWidget):
         self.queue.new_source()
 
     def show_queue(self):
-        self.setCurrentWidget(self.queue)
+        if not self.app.fastflix.config.sticky_tabs:
+            self.setCurrentWidget(self.queue)
 
     def show_status(self):
-        self.setCurrentWidget(self.status)
+        if not self.app.fastflix.config.sticky_tabs:
+            self.setCurrentWidget(self.status)
 
     def cleanup(self):
         self.status.cleanup()

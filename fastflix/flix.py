@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
+import json
 import logging
 import os
 import re
 from pathlib import Path
 from subprocess import PIPE, CompletedProcess, Popen, TimeoutExpired, run, check_output
-from typing import List, Tuple, Union
-from distutils.version import LooseVersion
+from typing import List, Optional, Tuple, Union
+from packaging import version
+import shlex
 
 import reusables
 from box import Box, BoxError
-from pathvalidate import sanitize_filepath
 
 from fastflix.exceptions import FlixError
 from fastflix.language import t
 from fastflix.models.config import Config
 from fastflix.models.fastflix_app import FastFlixApp
+from fastflix.shared import clean_env
 
 here = os.path.abspath(os.path.dirname(__file__))
 re_tff = re.compile(r"TFF:\s+(\d+)")
@@ -22,6 +24,73 @@ re_bff = re.compile(r"BFF:\s+(\d+)")
 re_progressive = re.compile(r"Progressive:\s+(\d+)")
 
 logger = logging.getLogger("fastflix")
+
+HDR10_parser_version = None
+
+ffmpeg_valid_color_primaries = [
+    "bt709",
+    "bt470m",
+    "bt470bg",
+    "smpte170m",
+    "smpte240m",
+    "film",
+    "bt2020",
+    "smpte428",
+    "smpte428_1",
+    "smpte431",
+    "smpte432",
+    "jedec-p22",
+]
+
+ffmpeg_valid_color_transfers = [
+    "bt709",
+    "gamma22",
+    "gamma28",
+    "smpte170m",
+    "smpte240m",
+    "linear",
+    "log",
+    "log100",
+    "log_sqrt",
+    "log316",
+    "iec61966_2_4",
+    "iec61966-2-4",
+    "bt1361",
+    "bt1361e",
+    "iec61966_2_1",
+    "iec61966-2-1",
+    "bt2020_10",
+    "bt2020_10bit",
+    "bt2020_12",
+    "bt2020_12bit",
+    "bt2020-10",
+    "bt2020-10bit",
+    "bt2020-12",
+    "bt2020-12bit",
+    "smpte2084",
+    "smpte428",
+    "smpte428_1",
+    "smpte428-1",
+    "arib-std-b67",
+]
+
+ffmpeg_valid_color_space = [
+    "rgb",
+    "bt709",
+    "fcc",
+    "bt470bg",
+    "smpte170m",
+    "smpte240m",
+    "ycocg",
+    "bt2020nc",
+    "bt2020_ncl",
+    "bt2020c",
+    "bt2020_cl",
+    "smpte2085",
+    "chroma-derived-nc",
+    "chroma-derived-c",
+    "ictcp",
+]
 
 
 def clean_file_string(source):
@@ -56,9 +125,6 @@ def guess_bit_depth(pix_fmt: str, color_primaries: str = None) -> int:
         "yuva420p",
         "yuva422p",
         "yuva444p",
-        "yuvj420p",
-        "yuvj422p",
-        "yuvj444p",
     )
 
     ten = ("yuv420p10le", "yuv422p10le", "yuv444p10le", "gbrp10le", "gray10le", "p010le")
@@ -86,6 +152,7 @@ def execute(command: List, work_dir: Union[Path, str] = None, timeout: int = Non
         cwd=work_dir,
         timeout=timeout,
         encoding="utf-8",
+        env=clean_env(),
     )
 
 
@@ -93,7 +160,15 @@ def ffmpeg_configuration(app, config: Config, **_):
     """Extract the version and libraries available from the specified version of FFmpeg"""
     res = execute([f"{config.ffmpeg}", "-version"])
     if res.returncode != 0:
-        raise FlixError(f'"{config.ffmpeg}" file not found')
+        if not res.stdout or "ffmpeg version" not in res.stdout:
+            logger.error(f"{config.ffmpeg} command stdout: {res.stdout}")
+            logger.error(f"{config.ffmpeg} command stderr: {res.stderr}")
+            raise FlixError(
+                f'"{config.ffmpeg}" file not found or errored while executing. Return code {res.returncode}'
+            )
+        logger.warning(
+            f"{config.ffmpeg} returned non-zero exit code {res.returncode} but produced valid output, continuing"
+        )
     config = []
     try:
         version = res.stdout.split(" ", 4)[2]
@@ -105,14 +180,26 @@ def ffmpeg_configuration(app, config: Config, **_):
             config = [x[9:].strip() for x in line[len(line_denote) :].split(" ") if x.startswith("--enable")]
     app.fastflix.ffmpeg_version = version
     app.fastflix.ffmpeg_config = config
-    # return version, config
+
+    # Parse libavcodec major version (e.g. 62 for FFmpeg 8.x)
+    for line in res.stdout.split("\n"):
+        if line.strip().startswith("libavcodec"):
+            try:
+                app.fastflix.libavcodec_version = int(line.split()[1].rstrip("."))
+            except (ValueError, IndexError):
+                logger.warning(f"Could not parse libavcodec version from: {line.strip()}")
+            break
 
 
 def ffprobe_configuration(app, config: Config, **_):
     """Extract the version of ffprobe"""
     res = execute([f"{config.ffprobe}", "-version"])
     if res.returncode != 0:
-        raise FlixError(f'"{config.ffprobe}" file not found')
+        if not res.stdout or "ffprobe version" not in res.stdout:
+            raise FlixError(f'"{config.ffprobe}" file not found')
+        logger.warning(
+            f"{config.ffprobe} returned non-zero exit code {res.returncode} but produced valid output, continuing"
+        )
     try:
         version = res.stdout.split(" ", 4)[2]
     except (ValueError, IndexError):
@@ -121,7 +208,10 @@ def ffprobe_configuration(app, config: Config, **_):
 
 
 def probe(app: FastFlixApp, file: Path) -> Box:
-    """Run FFprobe on a file"""
+    """
+    Run FFprobe on a file
+    ffprobe -v quiet -loglevel panic -print_format json -show_format -show_streams
+    """
     command = [
         f"{app.fastflix.config.ffprobe}",
         "-v",
@@ -132,11 +222,13 @@ def probe(app: FastFlixApp, file: Path) -> Box:
         "json",
         "-show_format",
         "-show_streams",
-        f"{clean_file_string(file)}",
+        clean_file_string(file),
     ]
     result = execute(command)
     if result.returncode != 0:
-        raise FlixError(f"Error code returned running FFprobe: {result.stdout} - {result.stderr}")
+        if not result.stdout or not result.stdout.strip().startswith("{"):
+            raise FlixError(f"Error code returned running FFprobe: {result.stdout} - {result.stderr}")
+        logger.warning(f"FFprobe returned non-zero exit code {result.returncode} but produced output, continuing")
 
     if result.stdout.strip() == "{}":
         raise FlixError(f"No output from FFprobe, not a known video type. stderr: {result.stderr}")
@@ -148,8 +240,65 @@ def probe(app: FastFlixApp, file: Path) -> Box:
         raise FlixError(result.stderr)
 
 
+def _unquote_concat_value(value: str) -> str:
+    """Parse a concat demuxer filename using ffmpeg's quoting rules (single quotes, backslash escapes)."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return value[1:-1]
+    out = []
+    quoted = False
+    chars = iter(value)
+    for char in chars:
+        if quoted:
+            if char == "'":
+                quoted = False
+            else:
+                out.append(char)
+        elif char == "'":
+            quoted = True
+        elif char == "\\":
+            out.append(next(chars, ""))
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def get_all_concat_items(file):
+    items = []
+    list_dir = Path(file).parent
+    with open(file, encoding="utf-8") as f:
+        for line in f:
+            if line.strip().startswith("#"):
+                continue
+            elif re.match(r"^\s*file\s", line):
+                filename = Path(_unquote_concat_value(line.strip()[4:]))
+                if not filename.is_absolute():
+                    filename = list_dir / filename
+                if not filename.exists():
+                    raise FlixError(f'No file "{filename}" exists')
+                items.append(filename)
+    return items
+
+
+def get_concat_item(file, location=0):
+    all_items = get_all_concat_items(file)
+    if not all_items:
+        raise FlixError("concat file must start with `file` on each line.")
+    if location == 0:
+        return all_items[0]
+    section = len(all_items) // 10
+    item_num = int((location * section)) - 1
+    if item_num >= len(all_items):
+        return all_items[-1]
+    return all_items[item_num]
+
+
 def parse(app: FastFlixApp, **_):
-    data = probe(app, app.fastflix.current_video.source)
+    source = app.fastflix.current_video.source
+    if source.name.lower().endswith("txt"):
+        source = get_concat_item(source)
+        app.fastflix.current_video.concat = True
+    data = probe(app, source)
     if "streams" not in data:
         raise FlixError(f"Not a video file, FFprobe output: {data}")
     streams = Box({"video": [], "audio": [], "subtitle": [], "attachment": [], "data": []})
@@ -180,8 +329,10 @@ def parse(app: FastFlixApp, **_):
 
 
 def extract_attachments(app: FastFlixApp, **_):
+    if app.fastflix.config.disable_cover_extraction:
+        return
     for track in app.fastflix.current_video.streams.attachment:
-        filename = track.get("tags", {}).get("filename", "")
+        filename = Path(track.get("tags", {}).get("filename", "")).name
         if filename.rsplit(".", 1)[0] in ("cover", "small_cover", "cover_land", "small_cover_land"):
             extract_attachment(
                 app.fastflix.config.ffmpeg,
@@ -193,36 +344,146 @@ def extract_attachments(app: FastFlixApp, **_):
 
 
 def extract_attachment(ffmpeg: Path, source: Path, stream: int, work_dir: Path, file_name: str):
+    output_path = work_dir / file_name
     try:
+        # First try -dump_attachment which works for true container attachments (fonts, etc.)
         execute(
             [
                 f"{ffmpeg}",
                 "-y",
+                f"-dump_attachment:{stream}",
+                clean_file_string(file_name),
                 "-i",
-                f"{clean_file_string(source)}",
+                clean_file_string(source),
+            ],
+            work_dir=work_dir,
+            timeout=10,
+        )
+        if output_path.exists() and output_path.stat().st_size > 0:
+            return
+    except TimeoutExpired:
+        pass
+    except Exception:
+        pass
+
+    # For attached_pic streams (cover art stored as video streams), pipe the image data out.
+    # Using Popen + communicate(timeout) avoids FFmpeg reading the entire file before exiting.
+    try:
+        proc = Popen(
+            [
+                f"{ffmpeg}",
+                "-y",
+                "-i",
+                clean_file_string(source),
                 "-map",
                 f"0:{stream}",
                 "-c",
                 "copy",
-                "-vframes",
+                "-frames:v",
                 "1",
-                f"{clean_file_string(file_name)}",
+                "-f",
+                "image2pipe",
+                "pipe:1",
             ],
-            work_dir=work_dir,
-            timeout=5,
+            stdout=PIPE,
+            stderr=PIPE,
+            stdin=PIPE,
+            cwd=work_dir,
+            env=clean_env(),
         )
-    except TimeoutExpired:
-        logger.warning(f"WARNING Timeout while extracting cover file {file_name}")
+        try:
+            stdout, _ = proc.communicate(timeout=3)
+        except TimeoutExpired:
+            proc.kill()
+            stdout, _ = proc.communicate()
+
+        if stdout:
+            output_path.write_bytes(stdout)
+        else:
+            logger.warning(f"No image data received when extracting cover file {file_name}")
+    except Exception:
+        logger.warning(f"Failed to extract cover file {file_name}", exc_info=True)
 
 
 def generate_thumbnail_command(
-    config: Config, source: Path, output: Path, filters: str, start_time: float = 0, input_track: int = 0
-) -> str:
-    return (
-        f'"{config.ffmpeg}" -ss {start_time} -loglevel error -i "{clean_file_string(source)}" '
-        f" {filters} -an -y -map_metadata -1 -map 0:{input_track} "
-        f'-vframes 1 "{clean_file_string(output)}" '
-    )
+    config: Config,
+    source: Path,
+    output: Path,
+    filters: list[str] | str,
+    start_time: float = 0,
+    input_track: int = 0,
+) -> list[str]:
+    command = [str(config.ffmpeg)]
+
+    # Trim from start this many seconds
+    if start_time:
+        command += ["-ss", str(start_time)]
+
+    # Less logging
+    # Video file input
+    command += ["-loglevel", "warning", "-i", clean_file_string(source)]
+
+    if isinstance(filters, list):
+        command += filters
+    else:
+        command += shlex.split(filters)
+
+    # Apply video track selection
+    if "-map" not in (filters if isinstance(filters, list) else shlex.split(filters)):
+        command += ["-map", f"0:{input_track}"]
+
+    command += [
+        "-an",
+        "-y",
+        "-map_metadata",
+        "-1",
+        "-strict",
+        "unofficial",
+        "-frames:v",
+        "1",
+        "-update",
+        "1",
+        clean_file_string(output),
+    ]
+
+    return command
+
+
+def parse_cropdetect_output(stderr: str, video_width: int, video_height: int) -> Optional[List[int]]:
+    """Parse FFmpeg cropdetect output and return crop margins [right, bottom, left, top].
+
+    Collects all detected crop rectangles as (w, h, x, y) tuples, discards invalid ones (cropdetect reports
+    negative sizes on fully black frames), and returns the union of the remaining content rectangles. Each edge is
+    therefore tracked independently, so mixed letterbox/pillarbox samples never over-crop.
+    Returns None if no valid detections found.
+    """
+    detections = []
+    for line in stderr.splitlines():
+        if line.startswith("[Parsed_cropdetect"):
+            try:
+                w, h, x, y = [int(v) for v in line.rsplit("=")[1].split(":")]
+            except (ValueError, IndexError):
+                continue
+            if w <= 0 or h <= 0 or x < 0 or y < 0:
+                continue
+            detections.append((w, h, x, y))
+
+    if not detections:
+        return None
+
+    left = min(x for _, _, x, _ in detections)
+    top = min(y for _, _, _, y in detections)
+    content_right = max(x + w for w, _, x, _ in detections)
+    content_bottom = max(y + h for _, h, _, y in detections)
+
+    x, y = left, top
+    right = video_width - content_right
+    bottom = video_height - content_bottom
+
+    if right < 0 or bottom < 0:
+        return None
+
+    return [right, bottom, x, y]
 
 
 def get_auto_crop(
@@ -243,12 +504,12 @@ def get_auto_crop(
             "-ss",
             f"{start_time}",
             "-i",
-            f"{clean_file_string(source)}",
+            clean_file_string(source),
             "-map",
             f"0:{input_track}",
             "-vf",
-            "cropdetect",
-            "-vframes",
+            "cropdetect=round=2",
+            "-frames:v",
             "10",
             "-f",
             "null",
@@ -256,26 +517,16 @@ def get_auto_crop(
         ]
     )
 
-    width, height, x_crop, y_crop = None, None, None, None
-    for line in output.stderr.splitlines():
-        if line.startswith("[Parsed_cropdetect"):
-            w, h, x, y = [int(x) for x in line.rsplit("=")[1].split(":")]
-            if (not x_crop or (x_crop and x > x_crop)) and (not width or (width and w < width)):
-                width = w
-                x_crop = x
-            if (not height or (height and h < height)) and (not y_crop or (y_crop and y > y_crop)):
-                height = h
-                y_crop = y
+    if not output.stderr:
+        return
 
-    if None in (width, height, x_crop, y_crop):
-        return 0, 0, 0, 0
-
-    result_list.append([video_width - width - x_crop, video_height - height - y_crop, x_crop, y_crop])
+    crop_margins = parse_cropdetect_output(output.stderr, video_width, video_height)
+    if crop_margins is not None:
+        result_list.append(crop_margins)
 
 
 def detect_interlaced(app: FastFlixApp, config: Config, source: Path, **_):
     """http://www.aktau.be/2013/09/22/detecting-interlaced-video-with-ffmpeg/"""
-
     # Interlaced
     # [Parsed_idet_0 @ 00000] Repeated Fields: Neither:   815 Top:    88 Bottom:    98
     # [Parsed_idet_0 @ 00000] Single frame detection: TFF:   693 BFF:     0 Progressive:    39 Undetermined:   269
@@ -292,7 +543,7 @@ def detect_interlaced(app: FastFlixApp, config: Config, source: Path, **_):
                 f"{config.ffmpeg}",
                 "-hide_banner",
                 "-i",
-                f"{clean_file_string(source)}",
+                clean_file_string(source),
                 "-vf",
                 "idet",
                 "-frames:v",
@@ -308,6 +559,10 @@ def detect_interlaced(app: FastFlixApp, config: Config, source: Path, **_):
         )
     except Exception:
         logger.exception("Error while running the interlace detection command")
+        return
+
+    if not output.stderr:
+        logger.warning("Could not extract interlaced information")
         return
 
     for line in output.stderr.splitlines():
@@ -342,12 +597,42 @@ def ffmpeg_audio_encoders(app, config: Config) -> List:
     return encoders
 
 
+def ffmpeg_video_encoders(app, config: Config) -> List:
+    cmd = execute([f"{config.ffmpeg}", "-hide_banner", "-encoders"])
+    encoders = []
+    start_line = " ------"
+    started = False
+    for line in cmd.stdout.splitlines():
+        if started:
+            if line.strip().startswith("V"):
+                encoders.append(line.strip().split(" ")[1])
+        elif line.startswith(start_line):
+            started = True
+    app.fastflix.video_encoders = encoders
+    return encoders
+
+
+def ffmpeg_opencl_support(app, config: Config) -> bool:
+    if app.fastflix.config.opencl_support is not None:
+        app.fastflix.opencl_support = app.fastflix.config.opencl_support
+        return app.fastflix.opencl_support
+    cmd = execute([f"{config.ffmpeg}", "-hide_banner", "-loglevel", "error", "-init_hw_device", "opencl:0.0", "-h"])
+    app.fastflix.opencl_support = cmd.returncode == 0
+    app.fastflix.config.opencl_support = app.fastflix.opencl_support
+    return app.fastflix.opencl_support
+
+
 def convert_mastering_display(data: Box) -> Tuple[Box, str]:
     master_display = None
     cll = None
 
     def s(a, v, base=50_000):
-        upper, lower = [int(x) for x in a.get(v, "0/0").split("/")]
+        try:
+            upper, lower = [int(x) for x in a.get(v, "0/0").split("/")]
+        except ValueError:
+            raise FlixError(f"Could not parse HDR value {a} from {v}")
+        if lower <= 0:  # avoid division by zero
+            raise FlixError(f"HDR value outside expected range, {v} was {a}")
         if lower != base:
             upper *= base / lower
         value = int(upper)
@@ -377,11 +662,11 @@ def parse_hdr_details(app: FastFlixApp, **_):
         for video_stream in streams.video:
             if video_stream["index"] == video_track and video_stream.get("side_data_list"):
                 try:
-                    master_display, cll = convert_mastering_display(streams.video[0])
+                    master_display, cll = convert_mastering_display(video_stream)
                 except FlixError as err:
                     logger.error(str(err))
                 except Exception:
-                    logger.exception(f"Unexpected error while processing master-display from {streams.video[0]}")
+                    logger.exception(f"Unexpected error while processing master-display from {video_stream}")
                 else:
                     if master_display:
                         app.fastflix.current_video.hdr10_streams.append(
@@ -395,7 +680,7 @@ def parse_hdr_details(app: FastFlixApp, **_):
                     "-loglevel",
                     "panic",
                     "-select_streams",
-                    f"v:{video_stream.index}",
+                    f"{video_stream.index}",
                     "-print_format",
                     "json",
                     "-show_frames",
@@ -403,7 +688,7 @@ def parse_hdr_details(app: FastFlixApp, **_):
                     "%+#1",
                     "-show_entries",
                     "frame=color_space,color_primaries,color_transfer,side_data_list,pix_fmt",
-                    f"{clean_file_string(app.fastflix.current_video.source)}",
+                    clean_file_string(app.fastflix.current_video.source),
                 ]
             )
 
@@ -435,44 +720,85 @@ def parse_hdr_details(app: FastFlixApp, **_):
                     )
 
 
-def detect_hdr10_plus(app: FastFlixApp, config: Config, **_):
-    if not config.hdr10plus_parser or not config.hdr10plus_parser.exists():
-        return
+def get_hdr10_parser_version(config: Config) -> version:
+    global HDR10_parser_version
+    if HDR10_parser_version:
+        return HDR10_parser_version
+    HDR10_parser_version_output = check_output(
+        [str(config.hdr10plus_parser), "--version"], encoding="utf-8", env=clean_env()
+    )
 
-    hdr10plus_streams = []
+    _, version_string = HDR10_parser_version_output.rsplit(sep=" ", maxsplit=1)
+    HDR10_parser_version = version.parse(version_string)
+    logger.debug(f"Using HDR10 parser version {str(HDR10_parser_version).strip()}")
+    return HDR10_parser_version
 
-    hdr10_parser_version_output = check_output([str(config.hdr10plus_parser), "--version"], encoding="utf-8")
-    _, version_string = hdr10_parser_version_output.rsplit(sep=" ", maxsplit=1)
-    hdr10_parser_version = LooseVersion(version_string)
-    logger.debug(f"Using HDR10 parser version {hdr10_parser_version}")
 
-    for stream in app.fastflix.current_video.streams.video:
-        logger.debug(f"Checking for hdr10+ in stream {stream.index}")
-        process = Popen(
+def _detect_hdr10_plus_ffprobe(app: FastFlixApp, config: Config, stream) -> bool:
+    """Detect HDR10+ in a stream using ffprobe frame side data. Works with any codec."""
+    logger.debug(f"Checking for hdr10+ via ffprobe in stream {stream.index}")
+    try:
+        result = execute(
             [
-                str(config.ffmpeg),
-                "-y",
-                "-i",
+                str(config.ffprobe),
+                "-show_frames",
+                "-read_intervals",
+                "%+#1",
+                "-select_streams",
+                f"{stream.index}",
+                "-show_entries",
+                "frame=side_data_list",
+                "-of",
+                "json",
                 clean_file_string(app.fastflix.current_video.source),
-                "-map",
-                f"0:{stream.index}",
-                "-loglevel",
-                "panic",
-                "-c:v",
-                "copy",
-                "-vbsf",
-                "hevc_mp4toannexb",
-                "-f",
-                "hevc",
-                "-",
             ],
-            stdout=PIPE,
-            stderr=PIPE,
-            stdin=PIPE,  # FFmpeg can try to read stdin and wrecks havoc
+            timeout=30,
         )
+        if result.returncode != 0:
+            return False
+        data = json.loads(result.stdout)
+        for frame in data.get("frames", []):
+            for side_data in frame.get("side_data_list", []):
+                if "HDR10+" in side_data.get("side_data_type", ""):
+                    return True
+    except Exception:
+        logger.exception(f"Unexpected error during ffprobe HDR10+ detection for stream {stream.index}")
+    return False
 
+
+def _detect_hdr10_plus_tool(app: FastFlixApp, config: Config, stream) -> bool:
+    """Detect HDR10+ in an HEVC stream using hdr10plus_tool."""
+    logger.debug(f"Checking for hdr10+ via hdr10plus_tool in stream {stream.index}")
+    process = Popen(
+        [
+            str(config.ffmpeg),
+            "-y",
+            "-i",
+            clean_file_string(app.fastflix.current_video.source),
+            "-map",
+            f"0:{stream.index}",
+            "-loglevel",
+            "panic",
+            "-frames:v",
+            "60",
+            "-c:v",
+            "copy",
+            "-bsf:v",
+            "hevc_mp4toannexb",
+            "-f",
+            "hevc",
+            "-",
+        ],
+        stdout=PIPE,
+        stderr=PIPE,
+        stdin=PIPE,  # FFmpeg can try to read stdin and wrecks havoc
+        env=clean_env(),
+    )
+
+    try:
+        parser_version = get_hdr10_parser_version(config)
         hdr10_parser_command = [str(config.hdr10plus_parser), "--verify", "-"]
-        if hdr10_parser_version >= LooseVersion("1.0.0"):
+        if parser_version >= version.parse("1.0.0"):
             hdr10_parser_command.insert(-1, "extract")
 
         process_two = Popen(
@@ -481,14 +807,41 @@ def detect_hdr10_plus(app: FastFlixApp, config: Config, **_):
             stderr=PIPE,
             stdin=process.stdout,
             encoding="utf-8",
+            env=clean_env(),
         )
-
         try:
-            stdout, stderr = process_two.communicate()
+            stdout, stderr = process_two.communicate(timeout=60)
         except Exception:
-            logger.exception(f"Unexpected error while trying to detect HDR10+ metadata in stream {stream.index}")
+            process_two.kill()
+            process_two.wait()
+            raise
+    except Exception:
+        logger.exception(f"Unexpected error while trying to detect HDR10+ metadata in stream {stream.index}")
+        return False
+    finally:
+        if process.stdout:
+            process.stdout.close()
+        process.kill()
+        process.wait()
+        if process.stderr:
+            process.stderr.close()
+        if process.stdin:
+            process.stdin.close()
+    return "Dynamic HDR10+ metadata detected." in stdout
+
+
+def detect_hdr10_plus(app: FastFlixApp, config: Config, **_):
+    has_hdr10plus_tool = config.hdr10plus_parser and config.hdr10plus_parser.exists()
+
+    hdr10plus_streams = []
+
+    for stream in app.fastflix.current_video.streams.video:
+        codec = stream.get("codec_name", "")
+        if has_hdr10plus_tool and codec == "hevc":
+            if _detect_hdr10_plus_tool(app, config, stream):
+                hdr10plus_streams.append(stream.index)
         else:
-            if "Dynamic HDR10+ metadata detected." in stdout:
+            if _detect_hdr10_plus_ffprobe(app, config, stream):
                 hdr10plus_streams.append(stream.index)
 
     if hdr10plus_streams:

@@ -1,0 +1,168 @@
+name: Build executables
+on:
+  push:
+    branches: [ master, build ]
+  pull_request:
+    branches: [ master, develop ]
+
+jobs:
+  build-nix:
+    strategy:
+      matrix:
+        os: [ ubuntu-22.04, ubuntu-24.04, macos-15 ]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the latest version of uv and activate the environment
+        uses: astral-sh/setup-uv@v6
+        with:
+          activate-environment: true
+
+      - name: Gather build version (*nix)
+        run: |
+          mkdir dist
+          echo "::set-env name=VERSION::$(python scripts/get_version.py)"
+          echo "::set-env name=ARCH::$(python scripts/get_arch.py)"
+          echo Building branch ${{ env.GITHUB_REF }} - version ${{ env.VERSION }} - on ${{ env.ARCH }}
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+
+      - name: Install PySide6 apt Requirements
+        run: |
+          sudo apt update
+          sudo apt install libopengl0 freeglut3-dev libxcb-icccm4 libxkbcommon-x11-0 libxcb-xkb1 libxcb-render-util0 libxcb-randr0 libxcb-keysyms1 libxcb-image0 libxcb-shape0-dev libxcb-cursor-dev -y
+        if: ${{ startsWith(matrix.os, 'ubuntu') }}
+
+      - name: Install Python Dependencies
+        run: uv sync --frozen
+
+      - name: Build single executable
+        run: uv run pyinstaller FastFlix_Nix_OneFile.spec
+
+      - name: Copy license to dist
+        run: |
+          cp docs/build-licenses.txt dist/LICENSE
+
+      - name: Test executable
+        run: |
+          chmod +x dist/FastFlix
+          dist/FastFlix --version
+          dist/FastFlix --test
+
+      - name: Archive excutables
+        run: |
+          pushd dist
+          7z a -mm=Deflate -mfb=258 -mpass=15 FastFlix_${{ env.VERSION }}_${{ matrix.os }}_${{ env.ARCH }}.zip *
+          popd
+
+      - name: Build Mac App
+        if : ${{ startsWith(matrix.os, 'macos') }}
+        run: |
+          uv run python scripts/build_mac_app.py ${{ matrix.os }}
+          pushd dist
+          7z a -mm=Deflate -mfb=258 -mpass=15 FastFlix_${{ env.VERSION }}_appbundle_${{ matrix.os }}_${{ env.ARCH }}.zip FastFlix.app
+          popd
+
+      - name: Upload executable artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FastFlix_${{ env.VERSION }}_OUTER_DO_NOT_UPLOAD_${{ matrix.os }}_${{ env.ARCH }}
+          path: dist/*.zip
+
+
+  build-windows-2022:
+
+    runs-on: windows-2022
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+
+    - name: Install the latest version of uv and activate the environment
+      uses: astral-sh/setup-uv@v6
+      with:
+        activate-environment: true
+
+    - name: Gather build version
+      shell: powershell
+      run: |
+        mkdir dist
+        New-Item -Path Env: -Name VERSION -Value $(python.exe scripts\get_version.py)
+        echo "Building branch $env:GITHUB_REF - version $env:VERSION"
+        echo "::set-env name=VERSION::$env:VERSION"
+      env:
+        ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.24"
+        cache-dependency-path: go.sum
+
+    - name: Install go-winres (icon / manifest / version resources)
+      shell: bash
+      run: |
+        go install github.com/tc-hib/go-winres@v0.3.3
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    - name: Install Python Dependencies
+      run: uv sync --frozen
+
+    # Builds python runtime + dependencies (pinned by uv.lock), runs go-winres for the launcher and
+    # uninstaller, builds FastFlix.exe + uninstall.exe, writes cmd/installer/fastflix_dist.tar.zst, then
+    # runs go-winres for the installer and builds dist\FastFlix_installer.exe with
+    # -ldflags "-s -w -H windowsgui -X main.Version=<fastflix/version.py> -X main.BuildDate=<today>".
+    - name: Build distribution and installer
+      shell: cmd
+      run: uv run --with zstandard python scripts\build_distribution.py --archive --installer
+
+    - name: Go vet
+      shell: cmd
+      run: go vet ./...
+
+    - name: Go tests
+      shell: cmd
+      run: go test ./cmd/internal/...
+
+#    - uses: skymatic/code-sign-action@v1
+#      with:
+#        certificate: '${{ secrets.CODE_CERT_B64 }}'
+#        password: '${{ secrets.CODE_CERT_PASS }}'
+#        certificatesha1: '${{ secrets.CODE_CERT_THUMB }}'
+#        description: 'FastFlix'
+#        timestampUrl: 'http://timestamp.sectigo.com'
+#        folder: 'dist'
+#        recursive: true
+
+    - name: Test launcher
+      shell: cmd
+      run: |
+        dist\FastFlix\FastFlix.exe --version
+        dist\FastFlix\FastFlix.exe --test
+
+    - name: Package installer and portable archive
+      shell: cmd
+      run: |
+        move dist\FastFlix_installer.exe dist\FastFlix_${{ env.VERSION }}_installer.exe
+        copy docs\build-licenses.txt dist\FastFlix\LICENSE
+        7z a -mm=Deflate -mfb=258 -mpass=15 dist\FastFlix_${{ env.VERSION }}_win64.zip .\dist\FastFlix\*
+
+    - name: Upload portable archive artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: FastFlix_${{ env.VERSION }}_win64
+        path: dist/FastFlix_${{ env.VERSION }}_win64.zip
+
+    - name: Upload installer artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: FastFlix_${{ env.VERSION }}_installer
+        path: dist/FastFlix_${{ env.VERSION }}_installer.exe

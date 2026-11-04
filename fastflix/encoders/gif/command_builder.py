@@ -1,47 +1,95 @@
 # -*- coding: utf-8 -*-
 import secrets
+import shlex
 
 from fastflix.encoders.common.helpers import Command, generate_filters
 from fastflix.models.encode import GIFSettings
 from fastflix.models.fastflix import FastFlix
-from fastflix.shared import clean_file_string
+from fastflix.shared import sanitize
 
 
 def build(fastflix: FastFlix):
     settings: GIFSettings = fastflix.current_video.video_settings.video_encoder_settings
+    video_settings = fastflix.current_video.video_settings
 
-    palletgen_filters = generate_filters(custom_filters="palettegen", **fastflix.current_video.video_settings.dict())
+    # Get scale from Video property (computed based on resolution_method)
+    scale = fastflix.current_video.scale
 
-    filters = generate_filters(
-        custom_filters=f"fps={settings.fps:.2f}", raw_filters=True, **fastflix.current_video.video_settings.dict()
+    # Convert crop to dict if it exists (generate_filters expects dict, not Pydantic model)
+    crop = video_settings.crop.model_dump() if video_settings.crop else None
+
+    palettegen_args = f"=stats_mode={settings.stats_mode}"
+    if settings.max_colors != "256":
+        palettegen_args += f":max_colors={settings.max_colors}"
+
+    # Dropping frames first avoids scaling/tone mapping frames that never reach the GIF; with a speed change the
+    # frame rate has to be set after setpts, so it stays at the end of the chain then.
+    fps_first = video_settings.video_speed == 1
+    fps_filter = f"fps={settings.fps}"
+
+    # Scale must use lanczos for better GIF quality
+    base_filters = generate_filters(
+        selected_track=video_settings.selected_track,
+        source=fastflix.current_video.source,
+        crop=crop,
+        scale=scale,
+        scale_filter="lanczos",
+        rotate=video_settings.rotate,
+        vertical_flip=video_settings.vertical_flip,
+        horizontal_flip=video_settings.horizontal_flip,
+        video_speed=video_settings.video_speed,
+        reverse_video=video_settings.reverse_video,
+        deblock=video_settings.deblock,
+        deblock_size=video_settings.deblock_size,
+        brightness=video_settings.brightness,
+        saturation=video_settings.saturation,
+        contrast=video_settings.contrast,
+        gamma=video_settings.gamma,
+        hue=video_settings.hue,
+        sharpen=video_settings.sharpen,
+        denoise=video_settings.denoise,
+        deinterlace=video_settings.deinterlace,
+        remove_hdr=video_settings.remove_hdr,
+        tone_map=video_settings.tone_map,
+        start_filters=fps_filter if fps_first else None,
+        custom_filters=None if fps_first else fps_filter,
+        raw_filters=True,
     )
 
-    output_video = clean_file_string(fastflix.current_video.video_settings.output_path)
-    beginning = (
-        f'"{fastflix.config.ffmpeg}" -y '
-        f'{f"-ss {fastflix.current_video.video_settings.start_time}" if fastflix.current_video.video_settings.start_time else ""} '
-        f'{f"-to {fastflix.current_video.video_settings.end_time}" if fastflix.current_video.video_settings.end_time else ""} '
-        f'-i "{fastflix.current_video.source}" '
-    )
-    if settings.extra:
-        beginning += f"  "
+    output_video = str(sanitize(fastflix.current_video.video_settings.output_path))
+
+    beginning = [str(fastflix.config.ffmpeg)]
+    beginning.append("-y")
+    if video_settings.start_time:
+        beginning.extend(["-ss", str(video_settings.start_time)])
+    if video_settings.end_time:
+        beginning.extend(["-to", str(video_settings.end_time)])
+    if video_settings.source_fps:
+        beginning.extend(["-r", str(video_settings.source_fps)])
+    beginning.extend(["-i", str(fastflix.current_video.source)])
 
     temp_palette = fastflix.current_video.work_path / f"temp_palette_{secrets.token_hex(10)}.png"
 
+    extra_both = shlex.split(settings.extra) if settings.extra and settings.extra_both_passes else []
+    extra = shlex.split(settings.extra) if settings.extra else []
+
+    palettegen_graph = f"{base_filters};[v]palettegen{palettegen_args}[palette]"
     command_1 = (
-        f'{beginning} {palletgen_filters} {settings.extra if settings.extra_both_passes else ""} -y "{temp_palette}"'
+        beginning + ["-filter_complex", palettegen_graph, "-map", "[palette]"] + extra_both + ["-y", str(temp_palette)]
     )
 
-    gif_filters = f"fps={settings.fps:.2f}"
-    if filters:
-        gif_filters += f",{filters}"
-
+    # For GIF creation, apply same base filters then use palette
+    # Format: [base_filters];[v][1:v]paletteuse=dither={dither}[o]
+    filter_complex = f"{base_filters};[v][1:v]paletteuse=dither={settings.dither}:diff_mode=rectangle[o]"
     command_2 = (
-        f'{beginning} -i "{temp_palette}" '
-        f'-filter_complex "{filters};[v][1:v]paletteuse=dither={settings.dither}[o]" -map "[o]" {settings.extra} -y "{output_video}" '
+        beginning
+        + ["-i", str(temp_palette)]
+        + ["-filter_complex", filter_complex, "-map", "[o]"]
+        + extra
+        + ["-y", output_video]
     )
 
     return [
-        Command(command=command_1, name="Pallet generation", exe="ffmpeg"),
+        Command(command=command_1, name="Palette generation", exe="ffmpeg"),
         Command(command=command_2, name="GIF creation", exe="ffmpeg"),
     ]

@@ -2,7 +2,7 @@
 import logging
 
 from box import Box
-from qtpy import QtCore, QtWidgets
+from PySide6 import QtWidgets
 
 from fastflix.encoders.common.setting_panel import SettingPanel
 from fastflix.language import t
@@ -38,7 +38,18 @@ recommended_crfs = [
     "Custom",
 ]
 
-pix_fmts = ["8-bit: yuv420p", "10-bit: yuv420p10le"]
+pix_fmts = [
+    "8-bit: yuv420p",
+    "10-bit: yuv420p10le",
+    "12-bit: yuv420p12le",
+    "8-bit 420 Transparent: yuva420p",
+    "8-bit 422: yuv422p",
+    "8-bit 444: yuv444p",
+    "10-bit 422: yuv422p10le",
+    "10-bit 444: yuv444p10le",
+    "12-bit 422: yuv422p12le",
+    "12-bit 444: yuv444p12le",
+]
 
 
 class VP9(SettingPanel):
@@ -72,20 +83,35 @@ class VP9(SettingPanel):
         checkboxes.addLayout(self.init_row_mt())
         checkboxes.addStretch(1)
         checkboxes.addLayout(self.init_fast_first_pass())
+        checkboxes.addStretch(1)
+        checkboxes.addLayout(self.init_lossless())
 
         grid.addLayout(checkboxes, 5, 2, 1, 4)
 
-        # grid.addWidget(QtWidgets.QWidget(), 8, 0)
-        grid.setRowStretch(8, 1)
-        grid.addLayout(self._add_custom(), 10, 0, 1, 6)
+        grid.addLayout(self.init_tune_content(), 7, 0, 1, 2)
+        grid.addLayout(self.init_aq_mode(), 7, 2, 1, 4)
 
-        link_1 = link("https://trac.ffmpeg.org/wiki/Encode/VP9", t("FFMPEG VP9 Encoding Guide"))
-        link_2 = link("https://developers.google.com/media/vp9/hdr-encoding/", t("Google's VP9 HDR Encoding Guide"))
+        grid.addLayout(self.init_auto_alt_ref(), 8, 0, 1, 2)
+        grid.addLayout(self.init_lag_in_frames(), 8, 2, 1, 4)
+
+        grid.addLayout(self.init_sharpness(), 9, 0, 1, 2)
+
+        grid.setRowStretch(10, 1)
+        custom_layout = self._add_custom()
+
+        link_1 = link(
+            "https://trac.ffmpeg.org/wiki/Encode/VP9", t("FFMPEG VP9 Encoding Guide"), app.fastflix.config.theme
+        )
+        link_2 = link(
+            "https://developers.google.com/media/vp9/hdr-encoding/",
+            t("Google's VP9 HDR Encoding Guide"),
+            app.fastflix.config.theme,
+        )
 
         guide_label = QtWidgets.QLabel(f"{link_1} | {link_2}")
-        guide_label.setAlignment(QtCore.Qt.AlignBottom)
         guide_label.setOpenExternalLinks(True)
-        grid.addWidget(guide_label, 11, 0, 1, 6)
+        custom_layout.addWidget(guide_label)
+        grid.addLayout(custom_layout, 11, 0, 1, 6)
         self.setLayout(grid)
         self.hide()
 
@@ -177,6 +203,76 @@ class VP9(SettingPanel):
     def init_single_pass(self):
         return self._add_check_box(label="Single Pass (CRF)", tooltip="", widget_name="single_pass", opt="single_pass")
 
+    def init_lossless(self):
+        layout = self._add_check_box(
+            label="Lossless",
+            widget_name="lossless",
+            tooltip=(
+                "Enable lossless encoding mode.\n"
+                "Produces bit-exact output with no quality loss.\n"
+                "Rate control options are ignored in lossless mode."
+            ),
+            opt="lossless",
+            connect=lambda: (self._toggle_lossless(), self.main.page_update(build_thumbnail=False)),
+        )
+        return layout
+
+    def _toggle_lossless(self):
+        enabled = not self.widgets.lossless.isChecked()
+        self.qp_radio.setEnabled(enabled)
+        self.bitrate_radio.setEnabled(enabled)
+        self.widgets.crf.setEnabled(enabled)
+        self.widgets.custom_crf.setEnabled(enabled)
+        self.widgets.bitrate.setEnabled(enabled)
+        self.widgets.custom_bitrate.setEnabled(enabled)
+        self.widgets.single_pass.setEnabled(enabled)
+        self.widgets.fast_first_pass.setEnabled(enabled)
+
+    def init_auto_alt_ref(self):
+        return self._add_combo_box(
+            label="Alt Ref Frames",
+            tooltip="Enable automatic alternate reference frames.\nMost impactful VP9 quality feature for multi-pass encoding.",
+            widget_name="auto_alt_ref",
+            options=["Default", "0 (disabled)", "1", "2", "3", "4", "5", "6"],
+            opt="auto_alt_ref",
+        )
+
+    def init_lag_in_frames(self):
+        return self._add_combo_box(
+            label="Lag in Frames",
+            tooltip="Number of frames to look ahead for alternate reference frame selection.\nRecommended: 25.",
+            widget_name="lag_in_frames",
+            options=["Default", "0", "10", "16", "20", "25", "30", "40", "50"],
+            opt="lag_in_frames",
+        )
+
+    def init_tune_content(self):
+        return self._add_combo_box(
+            label="Tune Content",
+            tooltip="Content type tuning.\nscreen: for screen capture content\nfilm: for film content",
+            widget_name="tune_content",
+            options=["default", "screen", "film"],
+            opt="tune_content",
+        )
+
+    def init_aq_mode(self):
+        return self._add_combo_box(
+            label="AQ Mode",
+            tooltip="Adaptive quantization mode.",
+            widget_name="aq_mode",
+            options=["Default", "0 (none)", "1 (variance)", "2 (complexity)", "3 (cyclic)", "4 (equator360)"],
+            opt="aq_mode",
+        )
+
+    def init_sharpness(self):
+        return self._add_combo_box(
+            label="Sharpness",
+            tooltip="Loop filter sharpness (0-7).",
+            widget_name="sharpness",
+            options=["Default", "0", "1", "2", "3", "4", "5", "6", "7"],
+            opt="sharpness",
+        )
+
     def init_modes(self):
         return self._add_modes(recommended_bitrates, recommended_crfs, qp_name="crf")
 
@@ -186,6 +282,24 @@ class VP9(SettingPanel):
         self.main.build_commands()
 
     def update_video_encoder_settings(self):
+        auto_alt_ref_text = self.widgets.auto_alt_ref.currentText()
+        if not auto_alt_ref_text or auto_alt_ref_text == "Default":
+            auto_alt_ref = -1
+        else:
+            auto_alt_ref = int(auto_alt_ref_text.split()[0])
+
+        lag_in_frames_text = self.widgets.lag_in_frames.currentText()
+        lag_in_frames = -1 if not lag_in_frames_text or lag_in_frames_text == "Default" else int(lag_in_frames_text)
+
+        aq_mode_text = self.widgets.aq_mode.currentText()
+        if not aq_mode_text or aq_mode_text == "Default":
+            aq_mode = -1
+        else:
+            aq_mode = int(aq_mode_text.split()[0])
+
+        sharpness_text = self.widgets.sharpness.currentText()
+        sharpness = -1 if not sharpness_text or sharpness_text == "Default" else int(sharpness_text)
+
         settings = VP9Settings(
             quality=self.widgets.quality.currentText(),
             speed=self.widgets.speed.currentText(),
@@ -197,15 +311,66 @@ class VP9(SettingPanel):
             extra=self.ffmpeg_extras,
             extra_both_passes=self.widgets.extra_both_passes.isChecked(),
             fast_first_pass=self.widgets.fast_first_pass.isChecked(),
-            tile_columns=self.widgets.tile_columns.currentText()
-            if self.widgets.tile_columns.currentIndex() > 0
-            else "-1",
+            tile_columns=(
+                self.widgets.tile_columns.currentText() if self.widgets.tile_columns.currentIndex() > 0 else "-1"
+            ),
             tile_rows=self.widgets.tile_rows.currentText() if self.widgets.tile_rows.currentIndex() > 0 else "-1",
+            auto_alt_ref=auto_alt_ref,
+            lag_in_frames=lag_in_frames,
+            tune_content=self.widgets.tune_content.currentText(),
+            aq_mode=aq_mode,
+            sharpness=sharpness,
+            lossless=self.widgets.lossless.isChecked(),
         )
         encode_type, q_value = self.get_mode_settings()
         settings.crf = q_value if encode_type == "qp" else None
         settings.bitrate = q_value if encode_type == "bitrate" else None
         self.app.fastflix.current_video.video_settings.video_encoder_settings = settings
+
+    def _set_default_combo_from_value(self, widget_name, value, options):
+        """Set a combo box from model value where -1 means 'Default' and others match by first token."""
+        if value == -1:
+            self.widgets[widget_name].setCurrentIndex(0)  # "Default"
+            return
+        text = str(value)
+        for i, opt in enumerate(options):
+            if opt.split()[0] == text:
+                self.widgets[widget_name].setCurrentIndex(i)
+                return
+        self.widgets[widget_name].setCurrentIndex(0)
+
+    def update_profile(self):
+        auto_alt_ref_opts = ["Default", "0 (disabled)", "1", "2", "3", "4", "5", "6"]
+        lag_opts = ["Default", "0", "10", "16", "20", "25", "30", "40", "50"]
+        aq_opts = ["Default", "0 (none)", "1 (variance)", "2 (complexity)", "3 (cyclic)", "4 (equator360)"]
+        sharpness_opts = ["Default", "0", "1", "2", "3", "4", "5", "6", "7"]
+
+        self._set_default_combo_from_value(
+            "auto_alt_ref", self.app.fastflix.config.encoder_opt(self.profile_name, "auto_alt_ref"), auto_alt_ref_opts
+        )
+        self._set_default_combo_from_value(
+            "lag_in_frames", self.app.fastflix.config.encoder_opt(self.profile_name, "lag_in_frames"), lag_opts
+        )
+        self._set_default_combo_from_value(
+            "aq_mode", self.app.fastflix.config.encoder_opt(self.profile_name, "aq_mode"), aq_opts
+        )
+        self._set_default_combo_from_value(
+            "sharpness", self.app.fastflix.config.encoder_opt(self.profile_name, "sharpness"), sharpness_opts
+        )
+        super().update_profile()
+
+    def reload(self):
+        super().reload()
+        settings = self.app.fastflix.current_video.video_settings.video_encoder_settings
+        auto_alt_ref_opts = ["Default", "0 (disabled)", "1", "2", "3", "4", "5", "6"]
+        lag_opts = ["Default", "0", "10", "16", "20", "25", "30", "40", "50"]
+        aq_opts = ["Default", "0 (none)", "1 (variance)", "2 (complexity)", "3 (cyclic)", "4 (equator360)"]
+        sharpness_opts = ["Default", "0", "1", "2", "3", "4", "5", "6", "7"]
+
+        self._set_default_combo_from_value("auto_alt_ref", settings.auto_alt_ref, auto_alt_ref_opts)
+        self._set_default_combo_from_value("lag_in_frames", settings.lag_in_frames, lag_opts)
+        self._set_default_combo_from_value("aq_mode", settings.aq_mode, aq_opts)
+        self._set_default_combo_from_value("sharpness", settings.sharpness, sharpness_opts)
 
     def set_mode(self, x):
         self.mode = x.text()

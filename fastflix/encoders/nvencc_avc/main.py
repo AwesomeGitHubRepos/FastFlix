@@ -1,20 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 __author__ = "Chris Griffith"
-
-from pathlib import Path
-
-import pkg_resources
+import importlib.resources
 
 name = "AVC (NVEncC)"
 
-video_extension = "mkv"
+video_extensions = [".mkv", ".mp4", ".ts", ".mov", ".avi", ".mts", ".m2ts", ".m4v"]
 video_dimension_divisor = 1
-icon = str(Path(pkg_resources.resource_filename(__name__, f"../../data/encoders/icon_nvencc.png")).resolve())
+
+ref = importlib.resources.files("fastflix") / "data/encoders/icon_nvencc.png"
+with importlib.resources.as_file(ref) as icon_file:
+    icon = str(icon_file.resolve())
 
 enable_subtitles = True
 enable_audio = True
 enable_attachments = False
+enable_data = True
+original_audio_tracks_only = True
 
 # Taken from NVEncC64.exe --check-encoders
 audio_formats = [
@@ -95,5 +97,5 @@ audio_formats = [
     "wmav2",
 ]
 
-from fastflix.encoders.nvencc_avc.command_builder import build
-from fastflix.encoders.nvencc_avc.settings_panel import NVENCCAVC as settings_panel
+from fastflix.encoders.nvencc_avc.command_builder import build  # noqa: F401,E402
+from fastflix.encoders.nvencc_avc.settings_panel import NVENCCAVC as settings_panel  # noqa: F401,E402

@@ -6,13 +6,17 @@ import time
 from datetime import timedelta
 from typing import Optional
 
-from qtpy import QtCore, QtWidgets
+from queue import Empty
+
+from PySide6 import QtCore, QtWidgets
 
 from fastflix.exceptions import FlixError
 from fastflix.language import t
 from fastflix.models.fastflix_app import FastFlixApp
+from fastflix.models.encode import GifskiSettings
 from fastflix.models.video import Video
 from fastflix.shared import time_to_number, timedelta_to_str
+from fastflix.widgets.toggle_switch import ToggleSwitch
 
 logger = logging.getLogger("fastflix")
 
@@ -22,6 +26,7 @@ class StatusPanel(QtWidgets.QWidget):
     bitrate = QtCore.Signal(str)
     nvencc_signal = QtCore.Signal(str)
     tick_signal = QtCore.Signal()
+    progress_percent = QtCore.Signal(int)
 
     def __init__(self, parent, app: FastFlixApp):
         super().__init__(parent)
@@ -35,7 +40,7 @@ class StatusPanel(QtWidgets.QWidget):
 
         layout = QtWidgets.QGridLayout()
 
-        self.hide_nal = QtWidgets.QCheckBox(t("Hide NAL unit messages"))
+        self.hide_nal = ToggleSwitch(t("Hide NAL unit messages"))
         self.hide_nal.setChecked(True)
 
         self.eta_label = QtWidgets.QLabel(f"{t('Time Left')}: N/A")
@@ -68,7 +73,10 @@ class StatusPanel(QtWidgets.QWidget):
         self.tick_signal.connect(self.update_time_elapsed)
 
     def cleanup(self):
-        self.inner_widget.log_updater.terminate()
+        self.inner_widget.log_updater.request_shutdown()
+        self.inner_widget.log_updater.wait(1000)  # Wait up to 1 second for graceful shutdown
+        if self.inner_widget.log_updater.isRunning():
+            self.inner_widget.log_updater.terminate()
         self.ticker_thread.stop_signal.emit()
         self.ticker_thread.terminate()
 
@@ -104,6 +112,8 @@ class StatusPanel(QtWidgets.QWidget):
             if not speed:
                 self.eta_label.setText(f"{t('Time Left')}: N/A")
             self.eta_label.setText(f"{t('Time Left')}: {timedelta_to_str(data)}")
+            if length:
+                self.progress_percent.emit(min(100, int(time_passed / length * 100)))
 
     def update_bitrate(self, bitrate):
         if not bitrate or bitrate.strip() == "N/A":
@@ -129,6 +139,14 @@ class StatusPanel(QtWidgets.QWidget):
         Example line:
         [53.1%] 19/35 frames: 150.57 fps, 5010 kb/s, remain 0:01:55, GPU 10%, VE 96%, VD 42%, est out size 920.6MB
         """
+        # Parse percentage from start of line like [53.1%]
+        if raw_line.startswith("[") and "%" in raw_line:
+            try:
+                pct_str = raw_line.split("]")[0].lstrip("[").rstrip("%")
+                self.progress_percent.emit(min(100, int(float(pct_str))))
+            except (ValueError, IndexError):
+                pass
+
         for section in raw_line.split(","):
             section = section.strip()
             if section.startswith("remain"):
@@ -186,12 +204,14 @@ class Logs(QtWidgets.QTextBrowser):
             return
         if msg.startswith("frame="):
             try:
-                output = []
-                for i in (x.strip().split() for x in msg.split("=")):
-                    output.extend(i)
-
-                frame = dict(zip(output[0::2], output[1::2]))
-
+                frame = {}
+                output = [i for i in (x.strip().split() for x in msg.split("="))]
+                output[-1].append([])  # no final value
+                for i in range(0, len(output) - 1):
+                    frame[output[i][-1]] = output[i + 1][:-1]
+                for k in frame:
+                    if len(frame[k]) == 1:
+                        frame[k] = frame[k][0]
                 self.status_panel.speed.emit(f"{frame.get('time', '')}|{frame.get('speed', '').rstrip('x')}")
                 self.status_panel.bitrate.emit(frame.get("bitrate", ""))
             except Exception:
@@ -209,6 +229,12 @@ class Logs(QtWidgets.QTextBrowser):
             logger.error(f"Couldn't find video or command for UUID {video_uuid}:{command_uuid}")
             self.parent.current_video = None
             self.current_command = None
+        if self.parent.current_video and isinstance(
+            self.parent.current_video.video_settings.video_encoder_settings, GifskiSettings
+        ):
+            self.parent.size_label.setVisible(False)
+        else:
+            self.parent.size_label.setVisible(True)
         self.setText("")
         self.parent.started_at = datetime.datetime.now(datetime.timezone.utc)
 
@@ -217,6 +243,7 @@ class Logs(QtWidgets.QTextBrowser):
 
     def closeEvent(self, event):
         self.hide()
+        event.ignore()
 
 
 class ElapsedTimeTicker(QtCore.QThread):
@@ -233,9 +260,6 @@ class ElapsedTimeTicker(QtCore.QThread):
 
         self.state_signal.connect(self.set_state)
         self.stop_signal.connect(self.on_stop)
-
-    def __del__(self):
-        self.wait()
 
     def run(self):
         while not self.stop_received:
@@ -260,13 +284,18 @@ class LogUpdater(QtCore.QThread):
         super().__init__(parent)
         self.parent = parent
         self.log_queue = log_queue
+        self._shutdown = False
 
-    def __del__(self):
-        self.wait()
+    def request_shutdown(self):
+        """Request graceful shutdown of the thread."""
+        self._shutdown = True
 
     def run(self):
-        while True:
-            msg = self.log_queue.get()
+        while not self._shutdown:
+            try:
+                msg = self.log_queue.get(timeout=0.5)
+            except Empty:
+                continue
             if msg.startswith("CLEAR_WINDOW"):
                 self.parent.clear_window.emit(msg)
                 self.parent.timer_signal.emit("START")

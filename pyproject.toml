@@ -1,15 +1,135 @@
-[tool.black]
+[project]
+name = "fastflix"
+description = "GUI Encoder"
+authors = [{ name = "Chris Griffith", email = "chris@cdgriffith.com" }]
+readme = "README.md"
+#url = "https://fastflix.org"
+#download_url = "https://github.com/cdgriffith/FastFlix/releases"
+requires-python = ">=3.13"
+dynamic = ["version"]
+dependencies = [
+    "platformdirs~=4.7",
+    "chardet>=5.1.0,<5.2.0",
+    "colorama>=0.4,<1.0",
+    "coloredlogs>=15.0,<16.0",
+    "iso639-lang>=2.6.0,<3.0",
+    "mistune>=2.0,<3.0",
+    "packaging>=23.2",
+    "pathvalidate>=2.4,<3.0",
+    "psutil>=5.9,<6.0",
+    "pydantic>=2.0,<3.0",
+    "pyside6==6.10.1",
+    "python-box[all]>=7.4,<8.0",
+    "requests>=2.28,<3.0",
+    "setuptools>=75.8",
+    "wmi>=1.5.1; sys_platform == 'win32'",
+    "ffmpeg-normalize>=1.31.3,<2.0",
+    "reusables>=1.0.0",
+    "pgsrip>=0.1.0",
+    "pytesseract>=0.3.0",
+    "babelfish>=0.6.0",
+    "cleanit>=0.4.0",
+    "trakit>=0.2.0",
+    "opencv-python>=4.8.0",
+    "pysrt>=1.1.0",
+]
+
+[project.scripts]
+fastflix = "fastflix.__main__:start_fastflix"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fastflix*"]
+
+[tool.setuptools.package-data]
+"*" = ['*.yaml', '*.ico', '*.svg', '*.png', '*.qss']
+
+[build-system]
+requires = ["setuptools", "setuptools_scm[toml]>=6.2", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.2.0",
+    "pyinstaller>=6.13.0",
+    "pytest>=9.0",
+    "pytest-xdist>=3.5",
+    "ruff>=0.14",
+    "types-requests>=2.32",
+    "types-setuptools>=80.9",
+    "typing-extensions>=4.14",
+    "wheel>=0.46",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "fastflix.version.__version__" }
+
+[tool.pytest.ini_options]
+markers = [
+    "local_only: Tests that require local tools (FFmpeg, encoders) and skip on CI",
+    "e2e: End-to-end encode tests that run real FFmpeg encodes (local only, skip on CI)",
+]
+
+[tool.ruff]
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "venv",
+]
+
 line-length = 120
-target-version = ['py36', 'py37', 'py38']
-exclude = '''
-/(
-    \.eggs
-  | \.git
-  | \.idea
-  | \.pytest_cache
-  | _build
-  | build
-  | dist
-  | venv
-)/
-'''
+indent-width = 4
+
+target-version = "py312"
+
+[tool.ruff.lint]
+# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`) codes by default.
+# Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
+# McCabe complexity (`C901`) by default.
+#select = ["E4", "E7", "E9", "F"]
+#ignore = []
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = [ "F541"]
+unfixable = ["F401"]
+
+[tool.ruff.format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+
+line-ending = "lf"
+
+# Enable auto-formatting of code examples in docstrings. Markdown,
+# reStructuredText code/literal blocks and doctests are all supported.
+#
+# This is currently disabled by default, but it is planned for this
+# to be opt-out in the future.
+docstring-code-format = true
+
+# Set the line length limit used when formatting code snippets in
+# docstrings.
+#
+# This only has an effect when the `docstring-code-format` setting is
+# enabled.
+docstring-code-line-length = "dynamic"

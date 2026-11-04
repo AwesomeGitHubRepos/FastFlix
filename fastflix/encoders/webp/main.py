@@ -1,22 +1,25 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 __author__ = "Chris Griffith"
-from pathlib import Path
-
-import pkg_resources
+import importlib.resources
 
 name = "WebP"
 
 requires = "libwebp"
-video_extension = "webp"
+video_extensions = [".webp"]
 video_dimension_divisor = 2
-icon = str(Path(pkg_resources.resource_filename(__name__, f"../../data/encoders/icon_webp.png")).resolve())
+
+ref = importlib.resources.files("fastflix") / "data/encoders/icon_webp.png"
+with importlib.resources.as_file(ref) as icon_file:
+    icon = str(icon_file.resolve())
 
 enable_subtitles = False
 enable_audio = False
 enable_attachments = False
+enable_concat = True
+enable_data = False
 
 audio_formats = []
 
-from fastflix.encoders.webp.command_builder import build
-from fastflix.encoders.webp.settings_panel import WEBP as settings_panel
+from fastflix.encoders.webp.command_builder import build  # noqa: F401,E402
+from fastflix.encoders.webp.settings_panel import WEBP as settings_panel  # noqa: F401,E402

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from box import Box
-from qtpy import QtWidgets
+from PySide6 import QtWidgets
 
 from fastflix.encoders.common.setting_panel import SettingPanel
 from fastflix.models.encode import GIFSettings
@@ -21,6 +21,8 @@ class GIF(SettingPanel):
 
         grid.addLayout(self.init_dither(), 0, 0, 1, 2)
         grid.addLayout(self.init_fps(), 1, 0, 1, 2)
+        grid.addLayout(self.init_max_colors(), 2, 0, 1, 2)
+        grid.addLayout(self.init_statistics_mode(), 3, 0, 1, 2)
         grid.addLayout(self._add_custom(), 11, 0, 1, 6)
 
         grid.addWidget(QtWidgets.QWidget(), 5, 0, 5, 6)
@@ -40,6 +42,7 @@ class GIF(SettingPanel):
         return self._add_combo_box(
             label="Dither",
             widget_name="dither",
+            opt="dither",
             tooltip=(
                 "Dither is an intentionally applied form of noise used to randomize quantization error,\n"
                 "preventing large-scale patterns such as color banding in images."
@@ -55,16 +58,34 @@ class GIF(SettingPanel):
             ],
         )
 
+    def init_max_colors(self):
+        return self._add_combo_box(
+            label="Max Colors",
+            widget_name="max_colors",
+            options=["2", "3", "4", "8", "16", "32", "64", "128", "256"],
+            default=8,
+            opt="max_colors",
+        )
+
+    def init_statistics_mode(self):
+        return self._add_combo_box(
+            label="Statistics Mode",
+            widget_name="stats_mode",
+            options=["full", "diff", "single"],
+            default=0,
+            opt="stats_mode",
+        )
+
     def update_video_encoder_settings(self):
         self.app.fastflix.current_video.video_settings.video_encoder_settings = GIFSettings(
-            fps=int(self.widgets.fps.currentText()),
+            fps=self.widgets.fps.currentText(),
             dither=self.widgets.dither.currentText(),
             extra=self.ffmpeg_extras,
             pix_fmt="yuv420p",  # hack for thumbnails to show properly
+            max_colors=self.widgets.max_colors.currentText(),
+            stats_mode=self.widgets.stats_mode.currentText(),
             extra_both_passes=self.widgets.extra_both_passes.isChecked(),
         )
 
     def new_source(self):
         super().new_source()
-        self.widgets.fps.setCurrentIndex(14)
-        self.widgets.dither.setCurrentIndex(0)

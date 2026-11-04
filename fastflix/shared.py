@@ -4,16 +4,22 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta
-from distutils.version import StrictVersion
+from packaging import version as packaging_version
 from pathlib import Path
 from subprocess import run
+import platform
 
-from appdirs import user_data_dir
-import pkg_resources
+from platformdirs import user_data_dir
+import importlib.resources
 import requests
 import reusables
 from pathvalidate import sanitize_filepath
 
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from fastflix.language import t
+from fastflix.resources import clean_env, get_bool_env  # noqa: F401 (clean_env re-exported)
 
 try:
     # PyInstaller creates a temp folder and stores path in _MEIPASS
@@ -24,14 +30,17 @@ except AttributeError:
     base_path = os.path.abspath(".")
     pyinstaller = False
 
-from qtpy import QtCore, QtGui, QtWidgets
+# Detect if running from the Go launcher (embeddable Python distribution)
+go_launcher = os.environ.get("FASTFLIX_BUNDLED") == "1"
 
-from fastflix.language import t
+# True when running as any kind of packaged distribution (PyInstaller or Go launcher)
+bundled_mode = pyinstaller or go_launcher
 
-DEVMODE = os.getenv("DEVMODE", "").lower() in ("1", "true")
+DEVMODE = get_bool_env("DEVMODE")
 
-my_data = str(Path(pkg_resources.resource_filename(__name__, f"../data/icon.ico")).resolve())
-icon = QtGui.QIcon(my_data)
+ref = importlib.resources.files("fastflix") / "data/icon.ico"
+with importlib.resources.as_file(ref) as icon_file:
+    my_data = str(icon_file.resolve())
 
 logger = logging.getLogger("fastflix")
 no_border = (
@@ -40,9 +49,62 @@ no_border = (
 )
 
 
+def _measure_text_width(metrics, text):
+    """Measure the widest line in potentially multi-line text."""
+    lines = text.split("\n")
+    return max(metrics.horizontalAdvance(line) for line in lines)
+
+
+def shrink_text_to_fit(widget, padding=10, min_point_size=6):
+    """Shrink a widget's font until its text fits within its fixed width.
+
+    Works with QLabel, QPushButton, QCheckBox, and similar widgets.
+    Call after setting the widget's text and fixed width.
+
+    Uses widget-level stylesheet to set font-size, because the global parent
+    stylesheet (QWidget { font-size: Xpt; }) overrides widget.setFont() calls.
+    A widget's own stylesheet takes precedence over inherited stylesheets.
+    """
+    import re
+
+    from fastflix.ui_constants import FONTS
+    from fastflix.ui_scale import scaler
+
+    width = widget.maximumWidth() if widget.maximumWidth() < 16777215 else widget.width()
+    if width <= 0:
+        return
+    text = widget.text()
+    if not text:
+        return
+
+    # Start from the app's actual styled font size (matches the global stylesheet).
+    app_font_size_pt = max(6, round(scaler.scale_font(FONTS.LARGE) * 0.75))
+    font = widget.font()
+    font.setPointSizeF(app_font_size_pt)
+
+    metrics = QtGui.QFontMetrics(font)
+    available = width - padding
+    if _measure_text_width(metrics, text) <= available:
+        return
+
+    size = float(app_font_size_pt)
+    while size > min_point_size:
+        size -= 0.5
+        font.setPointSizeF(size)
+        metrics = QtGui.QFontMetrics(font)
+        if _measure_text_width(metrics, text) <= available:
+            break
+
+    # Apply via widget stylesheet to override the global parent stylesheet.
+    existing = widget.styleSheet() or ""
+    existing = re.sub(r"font-size:\s*[^;]+;?\s*", "", existing).strip()
+    sep = " " if existing else ""
+    widget.setStyleSheet(f"{existing}{sep}font-size: {size}pt;")
+
+
 class MyMessageBox(QtWidgets.QMessageBox):
-    def __init__(self):
-        QtWidgets.QMessageBox.__init__(self)
+    def __init__(self, parent=None):
+        QtWidgets.QMessageBox.__init__(self, parent)
         self.setSizeGripEnabled(True)
 
     def event(self, e):
@@ -65,20 +127,20 @@ class MyMessageBox(QtWidgets.QMessageBox):
         return result
 
 
-def message(msg, title=None):
-    sm = QtWidgets.QMessageBox()
+def message(msg, title=None, parent=None):
+    sm = QtWidgets.QMessageBox(parent)
     sm.setText(msg)
     if title:
         sm.setWindowTitle(title)
     sm.setStandardButtons(QtWidgets.QMessageBox.Ok)
-    sm.setWindowIcon(icon)
+    sm.setWindowIcon(QtGui.QIcon(my_data))
     sm.exec_()
 
 
-def error_message(msg, details=None, traceback=False, title=None):
-    em = MyMessageBox()
+def error_message(msg, details=None, traceback=False, title=None, parent=None):
+    em = MyMessageBox(parent)
     em.setText(msg)
-    em.setWindowIcon(icon)
+    em.setWindowIcon(QtGui.QIcon(my_data))
     if title:
         em.setWindowTitle(title)
     if details:
@@ -91,39 +153,145 @@ def error_message(msg, details=None, traceback=False, title=None):
     em.exec_()
 
 
-def yes_no_message(msg, title=None, yes_text=t("Yes"), no_text=t("No"), yes_action=None, no_action=None):
-    sm = QtWidgets.QMessageBox()
-    sm.setWindowTitle(t(title))
-    sm.setText(msg)
-    sm.addButton(yes_text, QtWidgets.QMessageBox.YesRole)
-    sm.addButton(no_text, QtWidgets.QMessageBox.NoRole)
-    sm.exec_()
-    if sm.clickedButton().text() == yes_text:
+def yes_no_message(msg, title=None, yes_text=t("Yes"), no_text=t("No"), yes_action=None, no_action=None, parent=None):
+    dialog = QtWidgets.QDialog(parent)
+    dialog.setWindowTitle(t(title))
+    dialog._button_clicked = None
+
+    layout = QtWidgets.QVBoxLayout()
+    layout.setContentsMargins(20, 15, 20, 15)
+    layout.setSpacing(15)
+    label = QtWidgets.QLabel(msg)
+    label.setWordWrap(True)
+    label.setAlignment(QtCore.Qt.AlignCenter)
+    layout.addWidget(label)
+
+    button_layout = QtWidgets.QHBoxLayout()
+
+    no_button = QtWidgets.QPushButton(no_text)
+    no_button.setMinimumHeight(30)
+    no_button.setStyleSheet("QPushButton { background-color: #555555; color: white; padding: 6px 20px; }")
+
+    def on_no():
+        dialog._button_clicked = False
+        dialog.reject()
+
+    no_button.clicked.connect(on_no)
+
+    yes_button = QtWidgets.QPushButton(yes_text)
+    yes_button.setMinimumHeight(30)
+    yes_button.setStyleSheet("QPushButton { background-color: #4a9eed; color: white; padding: 6px 20px; }")
+
+    def on_yes():
+        dialog._button_clicked = True
+        dialog.accept()
+
+    yes_button.clicked.connect(on_yes)
+
+    button_layout.addWidget(no_button)
+    button_layout.addStretch()
+    button_layout.addWidget(yes_button)
+    layout.addLayout(button_layout)
+
+    dialog.setLayout(layout)
+    dialog.setWindowIcon(QtGui.QIcon(my_data))
+    dialog.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred)
+    dialog.adjustSize()
+    dialog.exec()
+
+    if dialog._button_clicked is True:
         if yes_action:
             return yes_action()
         return True
-    elif sm.clickedButton().text() == no_text:
+    elif dialog._button_clicked is False:
         if no_action:
             return no_action()
         return False
     return None
 
 
-def latest_fastflix(no_new_dialog=False):
+def parse_release_version(tag):
+    try:
+        return packaging_version.parse(str(tag).strip().lstrip("vV"))
+    except packaging_version.InvalidVersion:
+        return None
+
+
+def select_release(data, legacy_windows=False):
+    """Pick the newest stable release from the GitHub releases response; None if nothing usable."""
+    best, best_version = None, None
+    if not isinstance(data, list):
+        return None
+    for release in data:
+        if not isinstance(release, dict) or release.get("prerelease") or release.get("draft"):
+            continue
+        version = parse_release_version(release.get("tag_name", ""))
+        if version is None or version.is_prerelease:
+            continue
+        if legacy_windows and version.major != 4:
+            continue
+        if best_version is None or version > best_version:
+            best, best_version = release, version
+    return best
+
+
+def safe_release_url(url):
+    return isinstance(url, str) and url.startswith("https://github.com/cdgriffith/FastFlix/")
+
+
+def latest_fastflix(app, show_new_dialog=False):
     from fastflix.version import __version__
 
-    url = "https://api.github.com/repos/cdgriffith/FastFlix/releases/latest"
+    url = "https://api.github.com/repos/cdgriffith/FastFlix/releases"
+    # contrib = link(
+    #     url="https://github.com/sponsors/cdgriffith?frequency=one-time&sponsor=cdgriffith",
+    #     text=t("Please consider supporting FastFlix with a one time contribution!"),
+    #     theme=app.fastflix.config.theme,
+    # )
+
+    logger.debug("Checking for newer versions of FastFlix")
+
     try:
-        data = requests.get(url, timeout=15 if no_new_dialog else 3).json()
+        response = requests.get(url, timeout=15 if show_new_dialog else 3)
+        response.raise_for_status()
+        data = response.json()
     except Exception:
         logger.warning(t("Could not connect to github to check for newer versions"))
-        if no_new_dialog:
+        if show_new_dialog:
             message(t("Could not connect to github to check for newer versions"))
         return
 
-    if data["tag_name"] != __version__ and StrictVersion(data["tag_name"]) > StrictVersion(__version__):
+    legacy_windows = False
+    if reusables.win_based:
+        try:
+            win_ver = int(platform.platform().lower().split("-")[1])
+        except Exception:
+            logger.warning(f"Could not extract Windows version from {platform.platform()}, please report this message")
+            win_ver = 0
+
+        legacy_windows = win_ver < 10
+        if legacy_windows:
+            logger.debug(f"Detected legacy Windows version {win_ver}, looking for 4.x builds only")
+
+    release = select_release(data, legacy_windows=legacy_windows)
+    if release is None:
+        logger.warning("No usable FastFlix releases found in the GitHub response")
+        if show_new_dialog:
+            message(t("Could not connect to github to check for newer versions"))
+        return
+    use_version = str(parse_release_version(release["tag_name"]))
+
+    try:
+        current_version = packaging_version.parse(__version__)
+    except packaging_version.InvalidVersion:
+        logger.warning(f"Could not parse current FastFlix version {__version__}")
+        return
+
+    if packaging_version.parse(use_version) > current_version:
         portable, installer = None, None
-        for asset in data["assets"]:
+        for asset in release["assets"]:
+            if not safe_release_url(asset.get("browser_download_url")):
+                continue
             if asset["name"].endswith("win64.zip"):
                 portable = asset["browser_download_url"]
             if asset["name"].endswith("installer.exe"):
@@ -131,25 +299,64 @@ def latest_fastflix(no_new_dialog=False):
 
         download_link = ""
         if installer:
-            download_link += (
-                f"<a href='{installer}'>{t('Download')} FastFlix {t('installer')} {data['tag_name']}</a><br>"
+            download_link += link(
+                url=installer,
+                text=f"{t('Download')} FastFlix {t('installer')} {use_version}",
+                theme=app.fastflix.config.theme,
             )
+            download_link += "<br><br>"
         if portable:
-            download_link += f"<a href='{portable}'>{t('Download')} FastFlix {t('portable')} {data['tag_name']}</a><br>"
+            download_link += link(
+                url=portable,
+                text=f"{t('Download')} FastFlix {t('portable')} {use_version}",
+                theme=app.fastflix.config.theme,
+            )
+            download_link += "<br><br>"
         if (not portable and not installer) or not reusables.win_based:
-            html_link = data["html_url"]
-            download_link = f"<a href='{html_link}'>{t('View')} FastFlix {data['tag_name']} now</a>"
+            html_link = release.get("html_url")
+            if not safe_release_url(html_link):
+                html_link = "https://github.com/cdgriffith/FastFlix/releases"
+            download_link = link(
+                url=html_link, text=f"{t('View')} FastFlix {use_version}", theme=app.fastflix.config.theme
+            )
+        logger.debug(f"Newer version found: {use_version}")
         message(
-            f"{t('There is a newer version of FastFlix available!')} <br> {download_link}",
+            f"{t('There is a newer version of FastFlix available!')} <br><br> {download_link} <br>",  # <br> {contrib} 💓<br>
             title=t("New Version"),
         )
         return
-    if no_new_dialog:
-        message(t("You are using the latest version of FastFlix"))
+    logger.debug("FastFlix is up to date")
+    if show_new_dialog:
+        message(t("You are using the latest version of FastFlix") + " <br>")  # <br> {contrib} 💓 <br>
+
+
+def play_completion_sound():
+    """Play the system notification sound, a popup-free way to know the queue finished (#745, #755)."""
+    try:
+        if sys.platform == "win32":
+            import winsound
+
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        else:
+            QtWidgets.QApplication.beep()
+    except Exception:
+        logger.debug("Could not play completion sound", exc_info=True)
 
 
 def file_date():
     return datetime.now().isoformat().replace(":", ".").rsplit(".", 1)[0]
+
+
+def number_to_time(number) -> str:
+    """Format seconds as H:MM:SS with millisecond precision (H:MM:SS.mmm) when there is a fraction."""
+    total_ms = max(int(round(float(number or 0) * 1000)), 0)
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    result = f"{hours}:{minutes:02}:{seconds:02}"
+    if milliseconds:
+        result += f".{milliseconds:03}"
+    return result
 
 
 def time_to_number(string_time: str) -> float:
@@ -159,26 +366,28 @@ def time_to_number(string_time: str) -> float:
     except ValueError:
         pass
     base, *extra = string_time.split(".")
-    micro = 0
+    total = 0.0
     if extra and len(extra) == 1:
-        try:
-            micro = int(extra[0])
-        except ValueError:
+        # Keep the fraction as digits: int("003") would turn ".003" into ".3" (#773)
+        fraction = extra[0].strip()
+        if not fraction.isdigit():
             logger.info(t("bad micro value"))
             return 0
-    total = float(f".{micro}")
+        total = float(f"0.{fraction}")
     for i, v in enumerate(reversed(base.split(":"))):
         try:
             v = int(v)
         except ValueError:
             logger.info(f"{t('Not a valid int for time conversion')}: {v}")
         else:
-            total += v * (60 ** i)
-    return total
+            total += v * (60**i)
+    # Round away float noise (3945 + 0.003 -> 3945.0030000000001) so commands get the exact typed value
+    return round(total, 6)
 
 
-def link(url, text):
-    return f'<a href="{url}" style="color: black" >{text}</a>'
+def link(url, text, theme):
+    color = "#afccd5" if theme.lower() in ("dark", "onyx") else "black"
+    return f'<a href="{url}" style="color: {color}" >{text}</a>'
 
 
 def open_folder(path):
@@ -188,7 +397,7 @@ def open_folder(path):
         elif sys.platform == "darwin":
             run(["open", path])
         else:
-            run(["xdg-open", path])
+            run(["xdg-open", path], env=clean_env())
     except FileNotFoundError:
         logger.error(f"Do not know which command to use to open: {path}")
 
@@ -258,15 +467,48 @@ def clean_file_string(source):
     return str(source).strip().strip("'\"")
 
 
+def quoted_path(source):
+    cleaned_string = (
+        str(source)
+        .strip()
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "'\\\\\\''")
+        .replace("\r\n", "")
+        .replace("\n", "")
+        .replace("\r", "")
+    )
+    return cleaned_string
+
+
 def sanitize(source):
     return str(sanitize_filepath(source, platform="Windows" if reusables.win_based else "Linux"))
     # return str().replace("\\", "/")
 
 
-def get_config():
+def get_config(portable_mode=False):
     config = os.getenv("FF_CONFIG")
     if config:
         return Path(config)
-    if Path("fastflix.yaml").exists():
+    if Path("fastflix.yaml").exists() or portable_mode:
         return Path("fastflix.yaml")
     return Path(user_data_dir("FastFlix", appauthor=False, roaming=True)) / "fastflix.yaml"
+
+
+def clear_list(the_list: list, close=False):
+    for i in range(len(the_list) - 1, -1, -1):
+        if close:
+            the_list[i].close()
+        del the_list[i]
+
+
+def get_filesafe_datetime():
+    return datetime.now().strftime("%Y%m%d")
+
+
+def parse_filesafe_datetime(dt: str):
+    return datetime.strptime(dt, "%Y%m%d")
+
+
+def is_date_older_than_7days(dt: datetime):
+    return (datetime.now() - dt) > timedelta(days=7)

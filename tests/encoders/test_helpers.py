@@ -1,0 +1,947 @@
+# -*- coding: utf-8 -*-
+import sys
+from pathlib import Path
+from unittest import mock
+
+from fastflix.encoders.common.helpers import (
+    Command,
+    generate_ffmpeg_start,
+    generate_ending,
+    generate_filters,
+    generate_all,
+    generate_color_details,
+)
+from fastflix.models.encode import x265Settings
+
+
+def test_command_class():
+    """Test the Command class with string and list commands."""
+    # Test string command creation
+    cmd = Command(command='ffmpeg -i "input.mkv" output.mp4', name="Test Command", exe="ffmpeg")
+    assert cmd.command == 'ffmpeg -i "input.mkv" output.mp4'
+    assert cmd.name == "Test Command"
+    assert cmd.exe == "ffmpeg"
+    assert cmd.item == "command"
+    assert cmd.shell is False
+    assert cmd.uuid is not None
+
+    # Test list command creation
+    cmd_list = Command(command=["ffmpeg", "-i", "input.mkv", "output.mp4"], name="List Command", exe="ffmpeg")
+    assert cmd_list.command == ["ffmpeg", "-i", "input.mkv", "output.mp4"]
+    assert isinstance(cmd_list.to_list(), list)
+    assert isinstance(cmd_list.to_string(), str)
+
+
+def test_generate_ffmpeg_start_basic(fastflix_instance):
+    """Test the generate_ffmpeg_start function with basic parameters."""
+    result = generate_ffmpeg_start(
+        source=Path(r"C:\test_  file.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        pix_fmt="yuv420p10le",
+    )
+
+    assert isinstance(result, list)
+    assert result[0] == "ffmpeg"
+    assert "-y" in result
+    assert "-i" in result
+    assert r"C:\test_  file.mkv" in result
+    assert "-map" in result
+    assert "0:0" in result
+    assert "-c:v" in result
+    assert "libx265" in result
+    assert "-pix_fmt" in result
+    assert "yuv420p10le" in result
+
+
+def test_generate_ffmpeg_start_with_options(fastflix_instance):
+    """Test the generate_ffmpeg_start function with various options."""
+    result = generate_ffmpeg_start(
+        source=Path("input.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        pix_fmt="yuv420p10le",
+        start_time=10,
+        end_time=60,
+        fast_seek=True,
+        video_title="Test Video",
+        video_track_title="Main Track",
+        maxrate=5000,
+        bufsize=10000,
+        source_fps="24",
+        vsync="cfr",
+        enable_opencl=True,
+        remove_hdr=True,
+        start_extra="--extra-option",
+    )
+
+    assert isinstance(result, list)
+    assert result[0] == "ffmpeg"
+    assert "--extra-option" in result
+    assert "-init_hw_device" in result
+    assert "-ss" in result
+    assert "10" in result
+    assert "-to" in result
+    assert "60" in result
+    assert "-r" in result
+    assert "24" in result
+    assert "-metadata" in result
+    assert "title=Test Video" in result
+    assert "-fps_mode" in result
+    assert "cfr" in result
+    assert "-maxrate:v" in result
+    assert "5000k" in result
+    assert "-bufsize:v" in result
+    assert "10000k" in result
+    assert "-metadata:s:v:0" in result
+    assert "title=Main Track" in result
+
+
+def test_generate_ffmpeg_start_string_start_extra_strips_quotes(fastflix_instance):
+    """Quoted values in a user supplied start_extra string must not keep literal quote characters."""
+    result = generate_ffmpeg_start(
+        source=Path("input.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        pix_fmt="yuv420p",
+        start_extra=r'-metadata title="My Movie" -i "C:\my dir\a.srt"',
+    )
+    assert "title=My Movie" in result
+    assert not any('"' in token for token in result)
+    if sys.platform == "win32":
+        assert r"C:\my dir\a.srt" in result
+
+
+def test_generate_ffmpeg_start_with_list_start_extra(fastflix_instance):
+    """Test generate_ffmpeg_start with start_extra as a list (VAAPI-style).
+
+    VAAPI encoders pass start_extra as a list of hardware init options.
+    Previously this crashed because shlex.split() was called on the list.
+    """
+    start_extra_list = [
+        "-init_hw_device",
+        "vaapi=hwdev:/dev/dri/renderD128",
+        "-hwaccel",
+        "vaapi",
+        "-hwaccel_device",
+        "hwdev",
+        "-hwaccel_output_format",
+        "vaapi",
+    ]
+    result = generate_ffmpeg_start(
+        source=Path("input.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="hevc_vaapi",
+        selected_track=0,
+        pix_fmt="vaapi",
+        start_extra=start_extra_list,
+    )
+
+    assert isinstance(result, list)
+    # All start_extra elements should appear in the command
+    assert "-init_hw_device" in result
+    assert "vaapi=hwdev:/dev/dri/renderD128" in result
+    assert "-hwaccel" in result
+    assert "vaapi" in result
+    assert "-hwaccel_device" in result
+    assert "hwdev" in result
+    assert "-hwaccel_output_format" in result
+    # start_extra should come before -y
+    init_idx = result.index("-init_hw_device")
+    y_idx = result.index("-y")
+    assert init_idx < y_idx
+
+
+def test_generate_ffmpeg_start_with_empty_list_start_extra(fastflix_instance):
+    """Test generate_ffmpeg_start with start_extra as an empty list."""
+    result = generate_ffmpeg_start(
+        source=Path("input.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        pix_fmt="yuv420p10le",
+        start_extra=[],
+    )
+
+    assert isinstance(result, list)
+    assert result[0] == "ffmpeg"
+    assert "-y" in result
+
+
+def test_generate_ffmpeg_start_numeric_times_are_strings(fastflix_instance):
+    """Test that numeric start_time and end_time values are converted to strings."""
+    result = generate_ffmpeg_start(
+        source=Path("input.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        pix_fmt="yuv420p10le",
+        start_time=10.5,
+        end_time=120.0,
+    )
+
+    assert isinstance(result, list)
+    for i, element in enumerate(result):
+        assert isinstance(element, str), f"Element at index {i} is {type(element).__name__}: {element!r}"
+    assert "-ss" in result
+    assert "10.5" in result
+    assert "-to" in result
+    assert "120.0" in result
+
+
+def test_generate_ending_basic():
+    """Test the generate_ending function with basic parameters."""
+    ending, output_fps = generate_ending(
+        audio=[],
+        subtitles=[],
+        output_video=Path("output.mkv"),
+    )
+
+    assert isinstance(ending, list)
+    assert "-map_metadata" in ending
+    assert "-1" in ending
+    assert "-map_chapters" in ending
+    assert "0" in ending
+    assert "output.mkv" in ending
+    assert output_fps == []
+
+
+def test_generate_ending_with_options():
+    """Test the generate_ending function with various options."""
+    ending, output_fps = generate_ending(
+        audio=["-map", "0:1", "-c:a", "copy"],
+        subtitles=["-map", "0:2", "-c:s", "copy"],
+        cover=["-attach", "cover.jpg"],
+        output_video=Path("output.mkv"),
+        copy_chapters=False,
+        remove_metadata=False,
+        output_fps="24",
+        source_has_rotation=True,
+        copy_data=True,
+    )
+
+    assert isinstance(ending, list)
+    assert "-metadata:s:v" in ending
+    assert "rotate=0" in ending
+    assert "-map_metadata" in ending
+    assert "0" in ending
+    assert "-map_chapters" in ending
+    assert "-1" in ending
+    assert "-r" in ending
+    assert "24" in ending
+    assert "-map" in ending
+    assert "0:1" in ending
+    assert "-c:a" in ending
+    assert "copy" in ending
+    assert "-attach" in ending
+    assert "cover.jpg" in ending
+    assert "0:d" in ending
+    assert "-c:d" in ending
+    assert "output.mkv" in ending
+    assert output_fps == ["-r", "24"]
+
+
+def test_generate_filters_basic():
+    """Test the generate_filters function with basic parameters."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+    )
+
+    # With no filters specified, should return empty list
+    assert result == []
+
+
+def test_generate_filters_with_crop():
+    """Test the generate_filters function with crop parameters."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        crop={"width": 1920, "height": 1080, "left": 0, "top": 0},
+    )
+
+    assert isinstance(result, list)
+    assert len(result) == 4
+    assert result[0] == "-filter_complex"
+    assert "[0:0]crop=1920:1080:0:0[v]" in result[1]
+    assert result[2] == "-map"
+    assert result[3] == "[v]"
+
+
+def test_generate_filters_with_scale():
+    """Test the generate_filters function with scale parameters."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        scale="1920:-8",
+    )
+
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "scale=1920:-8:flags=lanczos,setsar=1:1" in result[1]
+    assert result[2] == "-map"
+    assert result[3] == "[v]"
+
+
+def test_generate_filters_with_hdr_removal():
+    """Test the generate_filters function with HDR removal."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        remove_hdr=True,
+        tone_map="hable",
+    )
+
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "tonemap=tonemap=hable" in result[1]
+    assert result[2] == "-map"
+    assert result[3] == "[v]"
+
+
+def test_generate_filters_with_multiple_options():
+    """Test the generate_filters function with multiple options."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        crop={"width": 1920, "height": 1080, "left": 0, "top": 0},
+        scale="1920:-8",
+        rotate=1,
+        deinterlace=True,
+        brightness="0.1",
+        contrast="1.1",
+        saturation="1.2",
+        gamma="1.5",
+        video_speed=0.5,
+        sharpen="0.5",
+    )
+
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    filter_str = result[1]
+    assert "yadif" in filter_str
+    assert "crop=1920:1080:0:0" in filter_str
+    assert "scale=1920:-8:flags=lanczos,setsar=1:1" in filter_str
+    assert "transpose=1" in filter_str
+    assert "setpts=0.5*PTS" in filter_str
+    assert "brightness=0.1" in filter_str
+    assert "saturation=1.2" in filter_str
+    assert "contrast=1.1" in filter_str
+    assert "gamma=1.5" in filter_str
+    assert "cas=strength=0.5" in filter_str
+    assert result[2] == "-map"
+    assert result[3] == "[v]"
+
+
+def test_generate_all(fastflix_instance):
+    """Test the generate_all function."""
+    # Mock the component functions to isolate the test
+    with (
+        mock.patch("fastflix.encoders.common.helpers.build_audio") as mock_build_audio,
+        mock.patch("fastflix.encoders.common.helpers.build_subtitle") as mock_build_subtitle,
+        mock.patch("fastflix.encoders.common.helpers.build_attachments") as mock_build_attachments,
+        mock.patch("fastflix.encoders.common.helpers.generate_filters") as mock_generate_filters,
+        mock.patch("fastflix.encoders.common.helpers.generate_ending") as mock_generate_ending,
+        mock.patch("fastflix.encoders.common.helpers.generate_ffmpeg_start") as mock_generate_ffmpeg_start,
+    ):
+        # Set up the mock returns as lists
+        mock_build_audio.return_value = ["-map", "0:1", "-c:a", "copy"]
+        mock_build_subtitle.return_value = (["-map", "0:2", "-c:s", "copy"], None, None)
+        mock_build_attachments.return_value = ["-attach", "cover.jpg"]
+        mock_generate_filters.return_value = ["-filter_complex", "[0:0]scale=1920:-8[v]", "-map", "[v]"]
+        mock_generate_ending.return_value = (["-map_metadata", "-1", "output.mkv"], ["-r", "24"])
+        mock_generate_ffmpeg_start.return_value = ["ffmpeg", "-y", "-i", "input.mkv"]
+
+        # Set up the video encoder settings
+        fastflix_instance.current_video.video_settings.video_encoder_settings = x265Settings()
+
+        # Call the function
+        beginning, ending, output_fps = generate_all(fastflix_instance, "libx265")
+
+        # Check the results
+        assert beginning == ["ffmpeg", "-y", "-i", "input.mkv"]
+        assert ending == ["-map_metadata", "-1", "output.mkv"]
+        assert output_fps == ["-r", "24"]
+
+        # Verify the mock calls
+        mock_build_audio.assert_called_once_with(
+            fastflix_instance.current_video.audio_tracks,
+            reverse_video=fastflix_instance.current_video.video_settings.reverse_video,
+        )
+        mock_build_subtitle.assert_called_once_with(
+            fastflix_instance.current_video.subtitle_tracks,
+            output_path=fastflix_instance.current_video.video_settings.output_path,
+        )
+        mock_build_attachments.assert_called_once_with(fastflix_instance.current_video.attachment_tracks, 0)
+
+
+def test_generate_all_with_list_start_extra(fastflix_instance):
+    """Test generate_all passes list start_extra through to generate_ffmpeg_start.
+
+    VAAPI encoders pass start_extra as a list. This test verifies the parameter
+    is forwarded correctly without being mangled by shlex.split().
+    """
+    with (
+        mock.patch("fastflix.encoders.common.helpers.build_audio") as mock_build_audio,
+        mock.patch("fastflix.encoders.common.helpers.build_subtitle") as mock_build_subtitle,
+        mock.patch("fastflix.encoders.common.helpers.build_attachments") as mock_build_attachments,
+        mock.patch("fastflix.encoders.common.helpers.generate_filters") as mock_generate_filters,
+        mock.patch("fastflix.encoders.common.helpers.generate_ending") as mock_generate_ending,
+        mock.patch("fastflix.encoders.common.helpers.generate_ffmpeg_start") as mock_generate_ffmpeg_start,
+    ):
+        mock_build_audio.return_value = []
+        mock_build_subtitle.return_value = ([], None, None)
+        mock_build_attachments.return_value = []
+        mock_generate_filters.return_value = []
+        mock_generate_ending.return_value = (["output.mkv"], [])
+        mock_generate_ffmpeg_start.return_value = ["ffmpeg", "-y", "-i", "input.mkv"]
+
+        fastflix_instance.current_video.video_settings.video_encoder_settings = x265Settings()
+
+        vaapi_start_extra = [
+            "-init_hw_device",
+            "vaapi=hwdev:/dev/dri/renderD128",
+            "-hwaccel",
+            "vaapi",
+        ]
+
+        generate_all(fastflix_instance, "hevc_vaapi", start_extra=vaapi_start_extra)
+
+        # Verify start_extra was passed as-is (list, not string)
+        call_kwargs = mock_generate_ffmpeg_start.call_args
+        assert call_kwargs.kwargs["start_extra"] == vaapi_start_extra
+
+
+def test_generate_ffmpeg_start_with_extra_inputs(fastflix_instance):
+    """Test generate_ffmpeg_start with extra -i inputs for external subtitles."""
+    result = generate_ffmpeg_start(
+        source=Path("input.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        pix_fmt="yuv420p10le",
+        extra_inputs=["-i", "/path/to/subs.srt", "-i", "/path/to/subs2.ass"],
+    )
+
+    assert isinstance(result, list)
+    # Extra inputs should appear after the primary -i source
+    i_indices = [i for i, x in enumerate(result) if x == "-i"]
+    assert len(i_indices) == 3  # primary + 2 external
+    # Primary source comes first
+    assert result[i_indices[0] + 1] == "input.mkv"
+    # External subs come after
+    assert result[i_indices[1] + 1] == "/path/to/subs.srt"
+    assert result[i_indices[2] + 1] == "/path/to/subs2.ass"
+
+
+def test_generate_ffmpeg_start_no_extra_inputs(fastflix_instance):
+    """Test generate_ffmpeg_start without extra_inputs (default behavior)."""
+    result = generate_ffmpeg_start(
+        source=Path("input.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        pix_fmt="yuv420p10le",
+    )
+
+    # Only one -i for the primary source
+    i_indices = [i for i, x in enumerate(result) if x == "-i"]
+    assert len(i_indices) == 1
+
+
+def test_generate_filters_with_external_burn_in_picture():
+    """Test generate_filters with burn_in_file_index for picture-based external subtitle."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        burn_in_subtitle_track=0,
+        burn_in_subtitle_type="picture",
+        burn_in_file_index=1,
+    )
+
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    # Should reference file index 1 for the subtitle overlay
+    assert "[1:0]" in result[1]
+    assert "[0:0]" in result[1]
+    assert "overlay" in result[1]
+
+
+def test_generate_filters_burn_in_file_index_default():
+    """Test generate_filters defaults burn_in_file_index=0 for embedded tracks."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        burn_in_subtitle_track=2,
+        burn_in_subtitle_type="picture",
+    )
+
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    # Should reference file index 0 (default)
+    assert "[0:0][0:2]overlay" in result[1]
+
+
+def test_generate_all_with_external_subtitles(fastflix_instance):
+    """Test generate_all collects external subtitle file paths and builds extra -i inputs."""
+    from fastflix.models.encode import SubtitleTrack
+
+    # Add an external subtitle track
+    fastflix_instance.current_video.subtitle_tracks.append(
+        SubtitleTrack(
+            index=0,
+            outdex=4,
+            language="fre",
+            subtitle_type="text",
+            enabled=True,
+            burn_in=False,
+            long_name="[EXT] french.srt",
+            external=True,
+            file_path="/path/to/french.srt",
+        )
+    )
+
+    with (
+        mock.patch("fastflix.encoders.common.helpers.build_audio") as mock_build_audio,
+        mock.patch("fastflix.encoders.common.helpers.build_subtitle") as mock_build_subtitle,
+        mock.patch("fastflix.encoders.common.helpers.build_attachments") as mock_build_attachments,
+        mock.patch("fastflix.encoders.common.helpers.generate_filters") as mock_generate_filters,
+        mock.patch("fastflix.encoders.common.helpers.generate_ending") as mock_generate_ending,
+        mock.patch("fastflix.encoders.common.helpers.generate_ffmpeg_start") as mock_generate_ffmpeg_start,
+    ):
+        mock_build_audio.return_value = []
+        mock_build_subtitle.return_value = ([], None, None)
+        mock_build_attachments.return_value = []
+        mock_generate_filters.return_value = []
+        mock_generate_ending.return_value = (["output.mkv"], [])
+        mock_generate_ffmpeg_start.return_value = ["ffmpeg", "-y", "-i", "input.mkv"]
+
+        fastflix_instance.current_video.video_settings.video_encoder_settings = x265Settings()
+
+        generate_all(fastflix_instance, "libx265")
+
+        # Verify extra_inputs was passed with the external subtitle file
+        call_kwargs = mock_generate_ffmpeg_start.call_args
+        assert call_kwargs.kwargs["extra_inputs"] == ["-i", "/path/to/french.srt"]
+
+        # Verify external track got file_index=1 assigned
+        ext_track = fastflix_instance.current_video.subtitle_tracks[-1]
+        assert ext_track.file_index == 1
+
+
+def test_generate_all_external_subs_fast_seek_includes_ss(fastflix_instance):
+    """Test that external subtitle inputs get -ss/-to when fast seek is used with a start time.
+
+    Without this, external subtitle timing is wrong because the primary video is seeked
+    but the external subtitle input starts from the beginning of the file.
+    """
+    from fastflix.models.encode import SubtitleTrack
+
+    # Set up fast seek with start/end times
+    fastflix_instance.current_video.video_settings.fast_seek = True
+    fastflix_instance.current_video.video_settings.start_time = 300
+    fastflix_instance.current_video.video_settings.end_time = 600
+
+    # Add an external subtitle track
+    fastflix_instance.current_video.subtitle_tracks.append(
+        SubtitleTrack(
+            index=0,
+            outdex=4,
+            language="fre",
+            subtitle_type="text",
+            enabled=True,
+            burn_in=False,
+            long_name="[EXT] french.srt",
+            external=True,
+            file_path="/path/to/french.srt",
+        )
+    )
+
+    with (
+        mock.patch("fastflix.encoders.common.helpers.build_audio") as mock_build_audio,
+        mock.patch("fastflix.encoders.common.helpers.build_subtitle") as mock_build_subtitle,
+        mock.patch("fastflix.encoders.common.helpers.build_attachments") as mock_build_attachments,
+        mock.patch("fastflix.encoders.common.helpers.generate_filters") as mock_generate_filters,
+        mock.patch("fastflix.encoders.common.helpers.generate_ending") as mock_generate_ending,
+        mock.patch("fastflix.encoders.common.helpers.generate_ffmpeg_start") as mock_generate_ffmpeg_start,
+    ):
+        mock_build_audio.return_value = []
+        mock_build_subtitle.return_value = ([], None, None)
+        mock_build_attachments.return_value = []
+        mock_generate_filters.return_value = []
+        mock_generate_ending.return_value = (["output.mkv"], [])
+        mock_generate_ffmpeg_start.return_value = ["ffmpeg", "-y", "-ss", "300", "-to", "600", "-i", "input.mkv"]
+
+        fastflix_instance.current_video.video_settings.video_encoder_settings = x265Settings()
+
+        generate_all(fastflix_instance, "libx265")
+
+        # Verify extra_inputs includes -ss and -to before the external -i
+        call_kwargs = mock_generate_ffmpeg_start.call_args
+        extra_inputs = call_kwargs.kwargs["extra_inputs"]
+        assert extra_inputs == ["-ss", "300", "-to", "600", "-i", "/path/to/french.srt"]
+
+
+def test_generate_all_external_subs_exact_seek_no_ss_in_extra(fastflix_instance):
+    """Test that external subtitle inputs do NOT get -ss/-to when exact seek (non-fast) is used.
+
+    With exact seek, -ss is placed after all inputs as an output option, applying globally.
+    """
+    from fastflix.models.encode import SubtitleTrack
+
+    # Set up exact seek with start/end times
+    fastflix_instance.current_video.video_settings.fast_seek = False
+    fastflix_instance.current_video.video_settings.start_time = 300
+    fastflix_instance.current_video.video_settings.end_time = 600
+
+    # Add an external subtitle track
+    fastflix_instance.current_video.subtitle_tracks.append(
+        SubtitleTrack(
+            index=0,
+            outdex=4,
+            language="fre",
+            subtitle_type="text",
+            enabled=True,
+            burn_in=False,
+            long_name="[EXT] french.srt",
+            external=True,
+            file_path="/path/to/french.srt",
+        )
+    )
+
+    with (
+        mock.patch("fastflix.encoders.common.helpers.build_audio") as mock_build_audio,
+        mock.patch("fastflix.encoders.common.helpers.build_subtitle") as mock_build_subtitle,
+        mock.patch("fastflix.encoders.common.helpers.build_attachments") as mock_build_attachments,
+        mock.patch("fastflix.encoders.common.helpers.generate_filters") as mock_generate_filters,
+        mock.patch("fastflix.encoders.common.helpers.generate_ending") as mock_generate_ending,
+        mock.patch("fastflix.encoders.common.helpers.generate_ffmpeg_start") as mock_generate_ffmpeg_start,
+    ):
+        mock_build_audio.return_value = []
+        mock_build_subtitle.return_value = ([], None, None)
+        mock_build_attachments.return_value = []
+        mock_generate_filters.return_value = []
+        mock_generate_ending.return_value = (["output.mkv"], [])
+        mock_generate_ffmpeg_start.return_value = ["ffmpeg", "-y", "-i", "input.mkv"]
+
+        fastflix_instance.current_video.video_settings.video_encoder_settings = x265Settings()
+
+        generate_all(fastflix_instance, "libx265")
+
+        # With exact seek, extra_inputs should only have -i (no -ss/-to)
+        call_kwargs = mock_generate_ffmpeg_start.call_args
+        extra_inputs = call_kwargs.kwargs["extra_inputs"]
+        assert extra_inputs == ["-i", "/path/to/french.srt"]
+
+
+def test_generate_color_details(fastflix_instance):
+    """Test the generate_color_details function."""
+    # Test with HDR removal enabled
+    fastflix_instance.current_video.video_settings.remove_hdr = True
+    result = generate_color_details(fastflix_instance)
+    assert result == ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+
+    # Test with HDR removal disabled and color settings
+    fastflix_instance.current_video.video_settings.remove_hdr = False
+    fastflix_instance.current_video.video_settings.color_primaries = "bt2020"
+    fastflix_instance.current_video.video_settings.color_transfer = "smpte2084"
+    fastflix_instance.current_video.video_settings.color_space = "bt2020nc"
+
+    result = generate_color_details(fastflix_instance)
+    assert result == ["-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc"]
+
+
+def test_generate_filters_with_vibrance():
+    """Test the generate_filters function with vibrance."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        vibrance="0.5",
+    )
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "vibrance=intensity=0.5" in result[1]
+
+
+def test_generate_filters_with_color_temperature():
+    """Test the generate_filters function with color temperature."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        color_temperature="5000",
+    )
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "colortemperature=temperature=5000" in result[1]
+
+
+def test_generate_filters_with_curves_preset():
+    """Test the generate_filters function with curves preset."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        curves_preset="vintage",
+    )
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "curves=preset=vintage" in result[1]
+
+
+def test_generate_filters_with_colorbalance():
+    """Test the generate_filters function with colorbalance."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        colorbalance="colorbalance=rs=0.15:bs=-0.15",
+    )
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "colorbalance=rs=0.15:bs=-0.15" in result[1]
+
+
+def test_generate_filters_with_unsharp():
+    """Test the generate_filters function with unsharp mask."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        unsharp="unsharp=5:5:1.0:5:5:0.5",
+    )
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "unsharp=5:5:1.0:5:5:0.5" in result[1]
+
+
+def test_generate_filters_with_deflicker():
+    """Test the generate_filters function with deflicker."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        deflicker="deflicker=mode=pm:size=5",
+    )
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "deflicker=mode=pm:size=5" in result[1]
+
+
+def test_generate_filters_with_pad():
+    """Test the generate_filters function with pad aspect ratio."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        pad_aspect="16:9",
+        pad_color="black",
+    )
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "pad=" in result[1]
+    assert "color=black" in result[1]
+
+
+def test_generate_filters_with_lut3d():
+    """Test the generate_filters function with LUT3D file."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        lut3d_path="/path/to/my.cube",
+    )
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "lut3d=" in result[1]
+    assert "my.cube" in result[1]
+
+
+def test_generate_filters_with_nlmeans_opencl():
+    """Test the generate_filters function with nlmeans_opencl denoise."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        denoise="nlmeans_opencl=s=1.0:p=3:r=9",
+        enable_opencl=True,
+    )
+    assert isinstance(result, list)
+    assert result[0] == "-filter_complex"
+    assert "hwupload" in result[1]
+    assert "nlmeans_opencl=s=1.0:p=3:r=9" in result[1]
+    assert "hwdownload" in result[1]
+
+
+def test_generate_filters_filter_chain_order():
+    """Test that filters are applied in the correct order."""
+    result = generate_filters(
+        selected_track=0,
+        source=Path("input.mkv"),
+        deinterlace=True,
+        crop={"width": 1920, "height": 1080, "left": 0, "top": 0},
+        scale="1920:-8",
+        denoise="nlmeans=s=1.0:p=3:r=9",
+        deflicker="deflicker=mode=pm:size=5",
+        unsharp="unsharp=5:5:1.0:5:5:0.5",
+        brightness="0.1",
+        hue="10",
+        vibrance="0.5",
+        colorbalance="colorbalance=rs=0.15:bs=-0.15",
+        color_temperature="5000",
+        curves_preset="vintage",
+        sharpen="0.5",
+    )
+    assert isinstance(result, list)
+    filter_str = result[1]
+    # Verify ordering: denoise before deflicker before unsharp before eq before hue before vibrance
+    assert filter_str.index("nlmeans") < filter_str.index("deflicker")
+    assert filter_str.index("deflicker") < filter_str.index("unsharp")
+    assert filter_str.index("unsharp") < filter_str.index("eq=brightness")
+    assert filter_str.index("eq=brightness") < filter_str.index("hue=h=")
+    assert filter_str.index("hue=h=") < filter_str.index("vibrance")
+    assert filter_str.index("vibrance") < filter_str.index("colorbalance")
+    assert filter_str.index("colorbalance") < filter_str.index("colortemperature")
+    assert filter_str.index("colortemperature") < filter_str.index("curves=preset")
+    assert filter_str.index("curves=preset") < filter_str.index("cas=strength")
+
+
+def test_reverse_forces_input_side_seek():
+    cmd = generate_ffmpeg_start(
+        source=Path("in.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        start_time=5,
+        end_time=10,
+        fast_seek=False,
+        reverse_video=True,
+        filters=["-filter_complex", "[0:0]reverse[v]", "-map", "[v]"],
+    )
+    assert cmd.index("-ss") < cmd.index("-i")
+    assert cmd.index("-to") < cmd.index("-i")
+
+
+def test_exact_seek_without_reverse_stays_after_input():
+    cmd = generate_ffmpeg_start(
+        source=Path("in.mkv"), ffmpeg=Path("ffmpeg"), encoder="libx265", selected_track=0, start_time=5, fast_seek=False
+    )
+    assert cmd.index("-ss") > cmd.index("-i")
+
+
+def test_nlmeans_opencl_inits_device_without_hdr_removal():
+    cmd = generate_ffmpeg_start(
+        source=Path("in.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        enable_opencl=True,
+        remove_hdr=False,
+        denoise="nlmeans_opencl=s=1.0:p=3:r=9",
+    )
+    assert "-init_hw_device" in cmd
+    assert "-filter_hw_device" in cmd
+
+
+def test_no_opencl_device_without_need():
+    cmd = generate_ffmpeg_start(
+        source=Path("in.mkv"),
+        ffmpeg=Path("ffmpeg"),
+        encoder="libx265",
+        selected_track=0,
+        enable_opencl=True,
+        remove_hdr=False,
+    )
+    assert "-init_hw_device" not in cmd
+
+
+def test_nlmeans_opencl_pix_fmt_matches_source():
+    f10 = generate_filters(0, denoise="nlmeans_opencl=s=1.0:p=3:r=9", enable_opencl=True, source_pix_fmt="yuv420p10le")
+    assert "format=p010,hwupload,nlmeans_opencl=s=1.0:p=3:r=9,hwdownload,format=p010" in f10[1]
+    f8 = generate_filters(0, denoise="nlmeans_opencl=s=1.0:p=3:r=9", enable_opencl=True, source_pix_fmt="yuv420p")
+    assert "format=yuv420p,hwupload" in f8[1]
+
+
+def test_nlmeans_opencl_falls_back_to_cpu_without_opencl():
+    f = generate_filters(0, denoise="nlmeans_opencl=s=1.0:p=3:r=9", enable_opencl=False)
+    assert "hwupload" not in f[1]
+    assert "nlmeans=s=1.0:p=3:r=9" in f[1]
+    assert "opencl" not in f[1]
+
+
+def test_copy_with_reverse_does_not_reverse_audio(fastflix_instance):
+    fastflix_instance.current_video.video_settings.reverse_video = True
+    fastflix_instance.current_video.video_settings.video_encoder_settings = x265Settings()
+    for t in fastflix_instance.current_video.audio_tracks:
+        t.conversion_codec = "aac"
+        t.conversion_bitrate = "128k"
+    beginning, ending, _ = generate_all(fastflix_instance, "copy", disable_filters=True, subs=False)
+    assert "areverse" not in " ".join(ending)
+    assert "reverse" not in " ".join(beginning)
+
+
+def test_pad_applied_after_rotation():
+    f = generate_filters(0, rotate=1, pad_aspect="16:9", pad_color="black")[1]
+    assert f.index("transpose=1") < f.index("pad=")
+
+
+def test_text_burn_in_before_reverse():
+    f = generate_filters(0, reverse_video=True, burn_in_subtitle_track=0, burn_in_subtitle_type="text", source="a.mkv")[
+        1
+    ]
+    assert f.index("subtitles=") < f.index("reverse")
+    assert f.count("subtitles=") == 1
+    f = generate_filters(0, burn_in_subtitle_track=0, burn_in_subtitle_type="text", source="a.mkv", scale="1280:-8")[1]
+    assert f.index("scale=") < f.index("subtitles=")
+
+
+def test_gop_length_zero_not_emitted():
+    base = dict(source=Path("in.mkv"), ffmpeg=Path("ffmpeg"), encoder="libx264", selected_track=0)
+    assert "-g" not in generate_ffmpeg_start(gop_length=0, **base)
+    assert "-g" not in generate_ffmpeg_start(gop_length=None, **base)
+    cmd = generate_ffmpeg_start(gop_length=48, **base)
+    assert cmd[cmd.index("-g") + 1] == "48"
+
+
+def test_data_track_metadata_uses_real_output_index():
+    from fastflix.models.encode import DataTrack
+
+    track = DataTrack(
+        index=5, outdex=99, codec_type="attachment", codec_name="ttf", mimetype="font/ttf", filename="a.ttf"
+    )
+    audio = ["-map", "0:1", "-c:1", "copy", "-map", "0:2"]
+    subs = ["-map", "0:3"]
+    cmd, _ = generate_ending(audio, subs, data_tracks=[track], output_video=Path("o.mkv"))
+    # video + 2 audio + 1 subtitle -> data stream is output index 4
+    assert "-metadata:s:4" in cmd
+    assert "-metadata:s:99" not in cmd
+    assert cmd[cmd.index("-metadata:s:4") + 1] in ("title=", "handler=")
+    assert "mimetype=font/ttf" in cmd
+    # Burned-in subtitle produces no map, so index shifts down
+    cmd, _ = generate_ending(audio, [], data_tracks=[track], output_video=Path("o.mkv"))
+    assert "-metadata:s:3" in cmd
+
+
+def _text_burn_filter(**kwargs):
+    base = dict(burn_in_subtitle_track=0, burn_in_subtitle_type="text", source="a.mkv")
+    return generate_filters(0, source_width=1920, source_height=1080, **base, **kwargs)[1]
+
+
+def test_text_burn_in_original_size_uses_cropped_size():
+    """#756: burned-in text was stretched after a crop because original_size was the uncropped source size."""
+    crop = {"width": 1920, "height": 800, "left": 0, "top": 140}
+    assert "original_size=1920x800" in _text_burn_filter(crop=crop)
+    assert "original_size=1920x800" in _text_burn_filter(crop=crop, scale="1280:-8")
+    assert "original_size=1920x1080" in _text_burn_filter()
+
+
+def test_text_burn_in_original_size_rotation_and_pad():
+    assert "original_size=1080x1920" in _text_burn_filter(rotate=1)
+    assert "original_size=1080x1920" in _text_burn_filter(rotate=3)
+    assert "original_size=1920x1080" in _text_burn_filter(rotate=2)
+    assert "original_size" not in _text_burn_filter(pad_aspect="4:3")
+
+
+def test_ffmpeg_vbv_needs_both_maxrate_and_bufsize():
+    """#762: maxrate alone is only for rigaya encoders, FFmpeg encoders still need both."""
+    base = dict(source=Path("in.mkv"), ffmpeg=Path("ffmpeg"), encoder="libx264", selected_track=0)
+    cmd = generate_ffmpeg_start(maxrate=8000, bufsize=None, **base)
+    assert "-maxrate:v" not in cmd and "-bufsize:v" not in cmd
+    cmd = generate_ffmpeg_start(maxrate=8000, bufsize=16000, **base)
+    assert cmd[cmd.index("-maxrate:v") + 1] == "8000k"
+    assert cmd[cmd.index("-bufsize:v") + 1] == "16000k"

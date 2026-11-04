@@ -1,12 +1,24 @@
 # -*- coding: utf-8 -*-
 import logging
+from typing import List
 
 from fastflix.encoders.common.helpers import Command
 from fastflix.models.encode import NVEncCAVCSettings
 from fastflix.models.video import Video
 from fastflix.models.fastflix import FastFlix
-from fastflix.shared import clean_file_string
-from fastflix.encoders.common.encc_helpers import build_subtitle, build_audio
+from fastflix.encoders.common.encc_helpers import (
+    build_subtitle,
+    build_audio,
+    build_data,
+    rigaya_auto_options,
+    rigaya_avformat_reader,
+    rigaya_trim_or_seek,
+    rigaya_extra_options,
+    nvenc_profile_args,
+    qvbr_quality_value,
+    nvenc_tune_args,
+    split_extra_args,
+)
 
 logger = logging.getLogger("fastflix")
 
@@ -15,49 +27,18 @@ def build(fastflix: FastFlix):
     video: Video = fastflix.current_video
     settings: NVEncCAVCSettings = fastflix.current_video.video_settings.video_encoder_settings
 
-    trim = ""
     try:
-        if "/" in video.frame_rate:
-            over, under = [int(x) for x in video.frame_rate.split("/")]
-            rate = over / under
-        else:
-            rate = float(video.frame_rate)
+        stream_id = int(video.current_video_stream["id"], 16)
     except Exception:
-        logger.exception("Could not get framerate of this movie!")
-    else:
-        if video.video_settings.end_time:
-            end_frame = int(video.video_settings.end_time * rate)
-            start_frame = 0
-            if video.video_settings.start_time:
-                start_frame = int(video.video_settings.start_time * rate)
-            trim = f"--trim {start_frame}:{end_frame}"
-        elif video.video_settings.start_time:
-            trim = f"--seek {video.video_settings.start_time}"
+        if len(video.streams.video) > 1:
+            logger.warning("Could not get stream ID from source, the proper video track may not be selected!")
+        stream_id = None
 
-    if (video.frame_rate != video.average_frame_rate) and trim:
-        logger.warning("Cannot use 'trim' when working with variable frame rate videos")
-        trim = ""
-
-    transform = ""
-    if video.video_settings.vertical_flip or video.video_settings.horizontal_flip:
-        transform = f"--vpp-transform flip_x={'true' if video.video_settings.horizontal_flip else 'false'},flip_y={'true' if video.video_settings.vertical_flip else 'false'}"
-
-    remove_hdr = ""
-    if video.video_settings.remove_hdr:
-        remove_type = (
-            video.video_settings.tone_map
-            if video.video_settings.tone_map in ("mobius", "hable", "reinhard")
-            else "mobius"
-        )
-        remove_hdr = f"--vpp-colorspace hdr2sdr={remove_type}" if video.video_settings.remove_hdr else ""
-
-    crop = ""
-    if video.video_settings.crop:
-        crop = f"--crop {video.video_settings.crop.left},{video.video_settings.crop.top},{video.video_settings.crop.right},{video.video_settings.crop.bottom}"
-
-    vbv = ""
-    if video.video_settings.maxrate:
-        vbv = f"--max-bitrate {video.video_settings.maxrate} --vbv-bufsize {video.video_settings.bufsize}"
+    vsync_setting = "cfr" if video.frame_rate == video.average_frame_rate else "vfr"
+    if video.video_settings.vsync == "cfr":
+        vsync_setting = "forcecfr"
+    elif video.video_settings.vsync == "vfr":
+        vsync_setting = "vfr"
 
     init_q = settings.init_q_i
     if settings.init_q_i and settings.init_q_p and settings.init_q_b:
@@ -71,72 +52,135 @@ def build(fastflix: FastFlix):
     if settings.max_q_i and settings.max_q_p and settings.max_q_b:
         max_q = f"{settings.max_q_i}:{settings.max_q_p}:{settings.max_q_b}"
 
-    try:
-        stream_id = int(video.current_video_stream["id"], 16)
-    except Exception:
-        if len(video.streams.video) > 1:
-            logger.warning("Could not get stream ID from source, the proper video track may not be selected!")
-        stream_id = None
-
-    aq = "--no-aq"
-    if settings.aq.lower() == "spatial":
-        aq = f"--aq --aq-strength {settings.aq_strength}"
-    elif settings.aq.lower() == "temporal":
-        aq = f"--aq-temporal --aq-strength {settings.aq_strength}"
-
-    command = [
-        f'"{clean_file_string(fastflix.config.nvencc)}"',
-        "-i",
-        f'"{clean_file_string(video.source)}"',
-        (f"--video-streamid {stream_id}" if stream_id else ""),
-        trim,
-        (f"--vpp-rotate {video.video_settings.rotate * 90}" if video.video_settings.rotate else ""),
-        transform,
-        (f'--output-res {video.video_settings.scale.replace(":", "x")}' if video.video_settings.scale else ""),
-        crop,
-        (f"--video-metadata clear" if video.video_settings.remove_metadata else "--video-metadata copy"),
-        (f'--video-metadata title="{video.video_settings.video_title}"' if video.video_settings.video_title else ""),
-        ("--chapter-copy" if video.video_settings.copy_chapters else ""),
-        "-c",
-        "avc",
-        (f"--vbr {settings.bitrate.rstrip('k')}" if settings.bitrate else f"--cqp {settings.cqp}"),
-        vbv,
-        (f"--vbr-quality {settings.vbr_target}" if settings.vbr_target is not None and settings.bitrate else ""),
-        (f"--qp-init {init_q}" if init_q and settings.bitrate else ""),
-        (f"--qp-min {min_q}" if min_q and settings.bitrate else ""),
-        (f"--qp-max {max_q}" if max_q and settings.bitrate else ""),
-        (f"--bframes {settings.b_frames}" if settings.b_frames else ""),
-        (f"--ref {settings.ref}" if settings.ref else ""),
-        f"--bref-mode {settings.b_ref_mode}",
-        "--preset",
-        settings.preset,
-        (f"--lookahead {settings.lookahead}" if settings.lookahead else ""),
-        aq,
-        "--colormatrix",
-        (video.video_settings.color_space or "auto"),
-        "--transfer",
-        (video.video_settings.color_transfer or "auto"),
-        "--colorprim",
-        (video.video_settings.color_primaries or "auto"),
-        "--multipass",
-        settings.multipass,
-        "--mv-precision",
-        settings.mv_precision,
-        "--chromaloc",
-        "auto",
-        "--colorrange",
-        "auto",
-        f"--avsync {'cfr' if video.frame_rate == video.average_frame_rate else 'vfr'}",
-        (f"--interlace {video.interlaced}" if video.interlaced else ""),
-        ("--vpp-yadif" if video.video_settings.deinterlace else ""),
-        (f"--vpp-colorspace hdr2sdr=mobius" if video.video_settings.remove_hdr else ""),
-        remove_hdr,
-        "--psnr --ssim" if settings.metrics else "",
-        build_audio(video.video_settings.audio_tracks, video.streams.audio),
-        build_subtitle(video.video_settings.subtitle_tracks, video.streams.subtitle),
-        settings.extra,
-        "-o",
-        f'"{clean_file_string(video.video_settings.output_path)}"',
+    command: List[str] = [
+        str(fastflix.config.nvencc),
     ]
 
-    return [Command(command=" ".join(x for x in command if x), name="NVEncC Encode", exe="NVEncE")]
+    command.extend(rigaya_avformat_reader(fastflix))
+
+    command.extend(["--device", str(settings.device)])
+    command.extend(["-i", str(video.source)])
+
+    if stream_id is not None:
+        command.extend(["--video-streamid", str(stream_id)])
+    command.extend(rigaya_trim_or_seek(video))
+    if video.video_settings.source_fps:
+        command.extend(["--fps", str(video.video_settings.source_fps)])
+    if video.video_settings.rotate:
+        command.extend(["--vpp-rotate", str(video.video_settings.rotate * 90)])
+    if video.video_settings.vertical_flip or video.video_settings.horizontal_flip:
+        flip_x = "true" if video.video_settings.horizontal_flip else "false"
+        flip_y = "true" if video.video_settings.vertical_flip else "false"
+        command.extend(["--vpp-transform", f"flip_x={flip_x},flip_y={flip_y}"])
+    if video.video_settings.crop:
+        crop = video.video_settings.crop
+        command.extend(["--crop", f"{crop.left},{crop.top},{crop.right},{crop.bottom}"])
+    if video.output_width is not None and video.output_height is not None:
+        command.extend(["--output-res", f"{video.output_width}x{video.output_height}"])
+
+    if video.video_settings.remove_metadata:
+        command.extend(["--video-metadata", "clear", "--metadata", "clear"])
+    else:
+        command.extend(["--video-metadata", "copy", "--metadata", "copy"])
+
+    if video.video_settings.video_title:
+        command.extend(["--metadata", f"title={video.video_settings.video_title}"])
+    if video.video_settings.copy_chapters:
+        command.append("--chapter-copy")
+
+    command.extend(["-c", "avc"])
+
+    qvbr = qvbr_quality_value(settings)
+    if qvbr:
+        command.extend(["--qvbr", qvbr])
+    elif settings.bitrate:
+        command.extend(["--vbr", settings.bitrate.rstrip("k")])
+    else:
+        command.extend(["--cqp", str(settings.cqp)])
+
+    if video.video_settings.maxrate:
+        command.extend(["--max-bitrate", str(video.video_settings.maxrate)])
+        if video.video_settings.bufsize:
+            command.extend(["--vbv-bufsize", str(video.video_settings.bufsize)])
+
+    if settings.vbr_target is not None and settings.bitrate and not qvbr:
+        command.extend(["--vbr-quality", str(settings.vbr_target)])
+    if init_q and (settings.bitrate or qvbr):
+        command.extend(["--qp-init", str(init_q)])
+    if min_q and (settings.bitrate or qvbr):
+        command.extend(["--qp-min", str(min_q)])
+    if max_q and (settings.bitrate or qvbr):
+        command.extend(["--qp-max", str(max_q)])
+    if settings.b_frames:
+        command.extend(["--bframes", str(settings.b_frames)])
+    if settings.ref:
+        command.extend(["--ref", str(settings.ref)])
+
+    command.extend(["--bref-mode", settings.b_ref_mode])
+    command.extend(["--preset", settings.preset])
+    command.extend(nvenc_profile_args(settings.profile, "avc"))
+    command.extend(nvenc_tune_args(settings.tune, "avc"))
+
+    if settings.lookahead:
+        command.extend(["--lookahead", str(settings.lookahead)])
+
+    if settings.aq.lower() == "spatial":
+        command.extend(["--aq", "--aq-strength", str(settings.aq_strength)])
+    elif settings.aq.lower() == "temporal":
+        command.extend(["--aq-temporal", "--aq-strength", str(settings.aq_strength)])
+    else:
+        command.append("--no-aq")
+
+    command.extend(["--level", (settings.level or "auto")])
+
+    command.extend(rigaya_auto_options(fastflix))
+
+    command.extend(["--multipass", settings.multipass])
+    command.extend(["--mv-precision", settings.mv_precision])
+    command.extend(["--avsync", vsync_setting])
+
+    if video.interlaced and video.interlaced != "False":
+        command.extend(["--interlace", str(video.interlaced)])
+    if video.video_settings.deinterlace:
+        command.append("--vpp-yadif")
+    hdr2sdr_param = None
+    if video.video_settings.remove_hdr:
+        remove_type = (
+            video.video_settings.tone_map
+            if video.video_settings.tone_map in ("mobius", "hable", "reinhard")
+            else "mobius"
+        )
+        hdr2sdr_param = f"hdr2sdr={remove_type}"
+
+    command.extend(rigaya_extra_options(video, hdr2sdr=hdr2sdr_param, fruc=True))
+
+    if settings.split_mode == "parallel":
+        command.extend(["--parallel", "auto"])
+
+    if settings.metrics:
+        command.extend(["--psnr", "--ssim"])
+
+    command.extend(build_audio(video.audio_tracks, video.streams.audio))
+    command.extend(
+        build_subtitle(
+            video.subtitle_tracks,
+            video.streams.subtitle,
+            video_height=video.height,
+            remove_metadata=video.video_settings.remove_metadata,
+        )
+    )
+    command.extend(
+        build_data(
+            video.data_tracks,
+            getattr(video.streams, "data", []),
+            getattr(video.streams, "attachment", []),
+            video.video_settings.output_path,
+        )
+    )
+
+    if settings.extra:
+        command.extend(split_extra_args(settings.extra))
+
+    command.extend(["-o", str(video.video_settings.output_path)])
+
+    return [Command(command=command, name="NVEncC Encode", exe="NVEncE")]

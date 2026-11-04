@@ -1,71 +1,306 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import logging
-import os
 import shutil
-import sys
 import time
 from pathlib import Path
-from subprocess import run
 
 import reusables
-from appdirs import user_data_dir
-from qtpy import QtCore, QtGui, QtWidgets
+from platformdirs import user_data_dir
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtGui import QAction
 
 from fastflix.exceptions import FastFlixInternalException
 from fastflix.language import t
-from fastflix.models.config import setting_types
+from fastflix.version import __version__
+from fastflix.models.config import setting_types, get_preset_defaults
 from fastflix.models.fastflix_app import FastFlixApp
-from fastflix.program_downloads import latest_ffmpeg
-from fastflix.resources import main_icon
-from fastflix.shared import clean_logs, error_message, latest_fastflix, message
-from fastflix.windows_tools import cleanup_windows_notification
+from fastflix.program_downloads import latest_ffmpeg, grab_stable_ffmpeg, download_hdr10plus_tool
+from fastflix.gpu_detect import update_rigaya_encoders
+from fastflix.resources import main_icon, get_icon, changes_file, local_changes_file, local_package_changes_file
+from fastflix.shared import (
+    clean_logs,
+    error_message,
+    latest_fastflix,
+    yes_no_message,
+    parse_filesafe_datetime,
+    is_date_older_than_7days,
+)
+from fastflix.ui_scale import scaler
+from fastflix.ui_styles import get_scaled_stylesheet, get_menubar_stylesheet
 from fastflix.widgets.about import About
 from fastflix.widgets.changes import Changes
-from fastflix.widgets.logs import Logs
+
+# from fastflix.widgets.logs import Logs
 from fastflix.widgets.main import Main
-from fastflix.widgets.profile_window import ProfileWindow
-from fastflix.widgets.progress_bar import ProgressBar, Task
+from fastflix.widgets.windows.profile_window import ProfileWindow
 from fastflix.widgets.settings import Settings
+from fastflix.widgets.status_bar import StatusBarWidget, STATE_COMPLETE, STATE_ERROR
+from fastflix.widgets.windows.concat import ConcatWindow
+from fastflix.widgets.windows.history_window import HistoryWindow
+from fastflix.widgets.windows.multiple_files import MultipleFilesWindow
+
 
 logger = logging.getLogger("fastflix")
 
 
 class Container(QtWidgets.QMainWindow):
+    MIN_WIDTH = 900
+    MIN_HEIGHT = 500
+    BASE_WIDTH = 1200
+    BASE_HEIGHT = 680
+
     def __init__(self, app: FastFlixApp, **kwargs):
         super().__init__(None)
         self.app = app
-        self.pb = None
+        self.profile_window = None
 
-        self.logs = Logs()
-        self.changes = Changes()
+        self.setMinimumSize(self.MIN_WIDTH, self.MIN_HEIGHT)
+        # Initialize scaler with base size
+        scaler.calculate_factors(self.BASE_WIDTH, self.BASE_HEIGHT)
+
+        self.app.setApplicationName("FastFlix")
+        self.app.setWindowIcon(QtGui.QIcon(main_icon))
+
+        self.tray_icon = QtWidgets.QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QtGui.QIcon(main_icon))
+
+        show_action = QAction(t("Open FastFlix"), self)
+        quit_action = QAction(t("Exit"), self)
+        hide_action = QAction(t("Minimize to Tray"), self)
+        show_action.triggered.connect(self.show)
+        hide_action.triggered.connect(self.hide)
+        quit_action.triggered.connect(self.close)
+        tray_menu = QtWidgets.QMenu()
+        tray_menu.addAction(show_action)
+        tray_menu.addAction(hide_action)
+        tray_menu.addAction(quit_action)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
+
+        self.tray_icon.setToolTip("FastFlix")
+
+        if self.app.fastflix.config.stay_on_top:
+            self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+        # self.logs = Logs()
+        self.changes = None
         self.about = None
         self.profile_details = None
 
         self.init_menu()
 
-        self.main = Main(self, app)
-        self.profile = ProfileWindow(self.app, self.main)
+        self.version_label = QtWidgets.QLabel(f"{__version__}", self)
+        self.version_label.setStyleSheet("color: #808080; background: transparent;")
+        self.version_label.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        self.version_label.adjustSize()
+        self.version_label.raise_()
 
-        self.setCentralWidget(self.main)
-        self.setMinimumSize(QtCore.QSize(1280, 700))
+        self.main = Main(self, app)
+
+        self.status_bar = StatusBarWidget(self.app, parent=self)
+
+        # Wrap Main + StatusBar in a vertical layout as the central widget
+        central = QtWidgets.QWidget(self)
+        central_layout = QtWidgets.QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self.main)
+        central_layout.addWidget(self.status_bar)
+        central.setLayout(central_layout)
+
+        self.setCentralWidget(central)
+        self.setBaseSize(QtCore.QSize(self.BASE_WIDTH, self.BASE_HEIGHT))
+        # Set initial window size to base dimensions
+        self.resize(self.BASE_WIDTH, self.BASE_HEIGHT)
         self.icon = QtGui.QIcon(main_icon)
         self.setWindowIcon(self.icon)
+        self._constrain_to_screen()
         self.main.set_profile()
 
+        # Connect encoding signals to status bar
+        self.main.encoding_status_signal.connect(lambda msg, state: self.status_bar.set_state(state, msg))
+        self.main.encoding_progress_signal.connect(self.status_bar.set_progress)
+        self.main.video_options.status.progress_percent.connect(self.status_bar.set_progress)
+
+        self._update_scaled_styles()
+        # self.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint)
+        self.moveFlag = False
+
+        # Listen for display topology changes (monitors added/removed/reconfigured)
+        gui_app = QtGui.QGuiApplication.instance()
+        gui_app.screenAdded.connect(self._on_screen_change)
+        gui_app.screenRemoved.connect(self._on_screen_change)
+        gui_app.primaryScreenChanged.connect(self._on_screen_change)
+        # Track geometry/DPI changes on all current screens
+        for screen in gui_app.screens():
+            self._connect_screen_signals(screen)
+        gui_app.screenAdded.connect(self._connect_screen_signals)
+
+    def _connect_screen_signals(self, screen: QtGui.QScreen) -> None:
+        """Connect geometry/DPI change signals for a screen."""
+        screen.geometryChanged.connect(self._on_screen_change)
+        screen.availableGeometryChanged.connect(self._on_screen_change)
+        screen.logicalDotsPerInchChanged.connect(self._on_screen_change)
+
+    def _on_screen_change(self, *_args) -> None:
+        """Handle display topology or geometry changes by re-validating window bounds."""
+        logger.debug("Screen change detected, re-validating window geometry")
+        # Use a short timer to coalesce rapid successive signals
+        if not hasattr(self, "_screen_change_timer"):
+            self._screen_change_timer = QtCore.QTimer(self)
+            self._screen_change_timer.setSingleShot(True)
+            self._screen_change_timer.setInterval(500)
+            self._screen_change_timer.timeout.connect(self._apply_screen_change)
+        self._screen_change_timer.start()
+
+    def _apply_screen_change(self) -> None:
+        """Apply window adjustments after a screen change."""
+        screen = self._current_screen()
+        if screen is None:
+            return
+        # Recalculate scale factors based on current window size
+        scaler.calculate_factors(self.width(), self.height())
+        self._update_scaled_styles()
+        self.ensure_window_in_bounds()
+
+    def _current_screen(self) -> QtGui.QScreen:
+        """Return the screen the window center is on, falling back to primary."""
+        screen = QtGui.QGuiApplication.screenAt(self.geometry().center())
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+        return screen
+
+    def _update_scaled_styles(self) -> None:
+        """Update all stylesheets based on current scale factors."""
+        self.setStyleSheet(get_scaled_stylesheet(self.app.fastflix.config.theme))
+
+    def _constrain_to_screen(self):
+        """Ensure the window fits within the available screen geometry."""
+        screen = self._current_screen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        # Clamp current size to fit screen if needed, but don't set a maximum
+        # so the window can still be maximized via the title bar button
+        if self.width() > available.width() or self.height() > available.height():
+            self.resize(min(self.width(), available.width()), min(self.height(), available.height()))
+
+    def ensure_window_in_bounds(self):
+        """Public method to ensure window stays within screen bounds after content changes."""
+        if self.isMaximized() or self.isFullScreen():
+            return
+        self._constrain_to_screen()
+        screen = self._current_screen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        geometry = self.geometry()
+
+        # Calculate new position if window is out of bounds
+        new_x = geometry.x()
+        new_y = geometry.y()
+        new_width = min(geometry.width(), available.width() - 20)
+        new_height = min(geometry.height(), available.height() - 20)
+
+        # Ensure window doesn't go off the right edge
+        if new_x + new_width > available.right():
+            new_x = max(available.left(), available.right() - new_width)
+
+        # Ensure window doesn't go off the bottom edge
+        if new_y + new_height > available.bottom():
+            new_y = max(available.top(), available.bottom() - new_height)
+
+        # Ensure window doesn't go off the left or top edges
+        new_x = max(available.left(), new_x)
+        new_y = max(available.top(), new_y)
+
+        # Apply the constrained geometry
+        self.setGeometry(new_x, new_y, new_width, new_height)
+
+    def _position_version_label(self):
+        menubar = self.menuBar()
+        menubar_height = menubar.height()
+        y = (menubar_height - self.version_label.height()) // 2
+        x = self.width() - self.version_label.width() - 8
+        self.version_label.move(x, y)
+        self.version_label.raise_()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        """Handle resize events to ensure window stays within screen bounds and update scaling."""
+        super().resizeEvent(event)
+        self._position_version_label()
+
+        # Always update scale factors and styles so the UI adapts to any window size
+        scaler.calculate_factors(event.size().width(), event.size().height())
+        self._update_scaled_styles()
+
+        # Don't adjust position when maximized/fullscreen — the OS manages geometry
+        if self.isMaximized() or self.isFullScreen():
+            return
+
+        screen = self._current_screen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        geometry = self.geometry()
+
+        # Check if window exceeds screen boundaries and adjust
+        needs_move = False
+        new_x = geometry.x()
+        new_y = geometry.y()
+
+        # Ensure window doesn't go off the right edge
+        if geometry.right() > available.right():
+            new_x = max(available.left(), available.right() - geometry.width())
+            needs_move = True
+
+        # Ensure window doesn't go off the bottom edge
+        if geometry.bottom() > available.bottom():
+            new_y = max(available.top(), available.bottom() - geometry.height())
+            needs_move = True
+
+        # Ensure window doesn't go off the left edge
+        if geometry.left() < available.left():
+            new_x = available.left()
+            needs_move = True
+
+        # Ensure window doesn't go off the top edge
+        if geometry.top() < available.top():
+            new_y = available.top()
+            needs_move = True
+
+        if needs_move:
+            self.move(new_x, new_y)
+
+    # def mousePressEvent(self, event):
+    #     if event.button() == QtCore.Qt.LeftButton:
+    #         self.moveFlag = True
+    #         self.movePosition = event.globalPos() - self.pos()
+    #         self.setCursor(QtGui.QCursor(QtCore.Qt.OpenHandCursor))
+    #         event.accept()
+    #
+    # def mouseMoveEvent(self, event):
+    #     if QtCore.Qt.LeftButton and self.moveFlag:
+    #         self.move(event.globalPos() - self.movePosition)
+    #         event.accept()
+    #
+    # def mouseReleaseEvent(self, event):
+    #     self.moveFlag = False
+    #     self.setCursor(QtCore.Qt.ArrowCursor)
+
     def closeEvent(self, a0: QtGui.QCloseEvent) -> None:
-        if self.pb:
-            try:
-                self.pb.stop_signal.emit()
-            except Exception:
-                pass
-        if self.main.converting:
+        self.app.fastflix.shutting_down = True
+        try:
+            self.status_bar.cancel()
+        except Exception:
+            pass
+        if self.app.fastflix.currently_encoding:
             sm = QtWidgets.QMessageBox()
             sm.setText(f"<h2>{t('There is a conversion in process!')}</h2>")
             sm.addButton(t("Cancel Conversion"), QtWidgets.QMessageBox.RejectRole)
             sm.addButton(t("Close GUI Only"), QtWidgets.QMessageBox.DestructiveRole)
             sm.addButton(t("Keep FastFlix Open"), QtWidgets.QMessageBox.AcceptRole)
-            sm.exec_()
+            sm.exec()
             if sm.clickedButton().text() == "Cancel Conversion":
                 self.app.fastflix.worker_queue.put(["cancel"])
                 time.sleep(0.5)
@@ -79,11 +314,22 @@ class Container(QtWidgets.QMainWindow):
 
         for item in self.app.fastflix.config.work_path.iterdir():
             if item.is_dir() and item.stem.startswith("temp_"):
-                shutil.rmtree(item, ignore_errors=True)
+                try:
+                    date_part = item.stem.split("_")[1]
+                    if is_date_older_than_7days(parse_filesafe_datetime(date_part)):
+                        shutil.rmtree(item, ignore_errors=True)
+                except Exception:
+                    logger.error(f"Failed to find datetime for temp folder {item.stem}, deleting!")
+                    shutil.rmtree(item, ignore_errors=True)
+            if item.is_file() and item.name.startswith("concat_"):
+                item.unlink(missing_ok=True)
             if item.name.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".tiff", ".tif")):
                 item.unlink()
-        if reusables.win_based:
-            cleanup_windows_notification()
+        # shutil.rmtree(self.app.fastflix.config.work_path / "covers", ignore_errors=True)
+
+        if self.app.fastflix.config.clean_old_logs:
+            self.clean_old_logs(show_errors=False)
+        self.status_bar.cleanup()
         self.main.close(from_container=True)
         super(Container, self).closeEvent(a0)
 
@@ -92,88 +338,210 @@ class Container(QtWidgets.QMainWindow):
 
     def init_menu(self):
         menubar = self.menuBar()
+        menubar.setNativeMenuBar(False)
+        menubar.setMinimumWidth(scaler.scale(300))
+        menubar.setStyleSheet(get_menubar_stylesheet())
 
         file_menu = menubar.addMenu(t("File"))
 
-        setting_action = QtWidgets.QAction(self.si(QtWidgets.QStyle.SP_FileDialogListView), t("Settings"), self)
+        load_folder = QAction(self.si(QtWidgets.QStyle.SP_DirOpenIcon), t("Load Directory"), self)
+        load_folder.triggered.connect(self.open_many)
+
+        setting_action = QAction(self.si(QtWidgets.QStyle.SP_FileDialogListView), t("Settings"), self)
         setting_action.setShortcut("Ctrl+S")
         setting_action.triggered.connect(self.show_setting)
 
-        exit_action = QtWidgets.QAction(self.si(QtWidgets.QStyle.SP_DialogCancelButton), t("Exit"), self)
+        self.stay_on_top_action = QAction(t("Stay on Top"), self)
+        self.stay_on_top_action.triggered.connect(self.set_stay_top)
+        if self.app.fastflix.config.stay_on_top:
+            self.stay_on_top_action.setIcon(self.si(QtWidgets.QStyle.SP_DialogYesButton))
+        else:
+            self.stay_on_top_action.setIcon(self.si(QtWidgets.QStyle.SP_DialogNoButton))
+
+        exit_action = QAction(self.si(QtWidgets.QStyle.SP_DialogCancelButton), t("Exit"), self)
         exit_action.setShortcut(QtGui.QKeySequence("Ctrl+Q"))
         exit_action.setStatusTip(t("Exit application"))
         exit_action.triggered.connect(self.close)
 
+        clear_video_action = QAction(self.si(QtWidgets.QStyle.SP_DialogCloseButton), t("Clear Current Video"), self)
+        clear_video_action.triggered.connect(lambda: self.main.clear_current_video())
+
+        file_menu.addAction(load_folder)
+        file_menu.addSeparator()
+        file_menu.addAction(clear_video_action)
+        file_menu.addSeparator()
         file_menu.addAction(setting_action)
+        file_menu.addSeparator()
+        file_menu.addAction(self.stay_on_top_action)
         file_menu.addSeparator()
         file_menu.addAction(exit_action)
 
         profile_menu = menubar.addMenu(t("Profiles"))
-        new_profile_action = QtWidgets.QAction(t("New Profile"), self)
+        new_profile_action = QAction(t("New Profile"), self)
         new_profile_action.triggered.connect(self.new_profile)
 
-        show_profile_action = QtWidgets.QAction(t("Current Profile Settings"), self)
+        show_profile_action = QAction(t("Current Profile Settings"), self)
         show_profile_action.triggered.connect(self.show_profile)
 
-        delete_profile_action = QtWidgets.QAction(t("Delete Current Profile"), self)
+        delete_profile_action = QAction(t("Delete Current Profile"), self)
         delete_profile_action.triggered.connect(self.delete_profile)
         profile_menu.addAction(new_profile_action)
         profile_menu.addAction(show_profile_action)
         profile_menu.addAction(delete_profile_action)
 
-        wiki_action = QtWidgets.QAction(self.si(QtWidgets.QStyle.SP_FileDialogInfoView), t("FastFlix Wiki"), self)
+        tools_menu = menubar.addMenu(t("Tools"))
+        concat_action = QAction(
+            QtGui.QIcon(get_icon("onyx-queue", self.app.fastflix.config.theme)), t("Concatenation Builder"), self
+        )
+        concat_action.triggered.connect(self.show_concat)
+        tools_menu.addAction(concat_action)
+
+        if self.app.fastflix.config.enable_history:
+            history_menu = menubar.addMenu(t("History"))
+
+            self.apply_last_action = QAction(t("Apply Last Used Settings"), self)
+            self.apply_last_action.triggered.connect(self.apply_last_history)
+            history_menu.addAction(self.apply_last_action)
+
+            view_history_action = QAction(t("View History"), self)
+            view_history_action.triggered.connect(self.show_history)
+            history_menu.addAction(view_history_action)
+
+            history_menu.aboutToShow.connect(self._update_history_menu_state)
+        else:
+            self.apply_last_action = None
+
+        wiki_action = QAction(self.si(QtWidgets.QStyle.SP_FileDialogInfoView), t("FastFlix Wiki"), self)
         wiki_action.triggered.connect(self.show_wiki)
 
-        about_action = QtWidgets.QAction(self.si(QtWidgets.QStyle.SP_FileDialogInfoView), t("About"), self)
+        about_action = QAction(self.si(QtWidgets.QStyle.SP_FileDialogInfoView), t("About"), self)
         about_action.triggered.connect(self.show_about)
 
-        changes_action = QtWidgets.QAction(self.si(QtWidgets.QStyle.SP_FileDialogDetailedView), t("View Changes"), self)
+        changes_action = QAction(self.si(QtWidgets.QStyle.SP_FileDialogDetailedView), t("View Changes"), self)
         changes_action.triggered.connect(self.show_changes)
 
-        log_dir_action = QtWidgets.QAction(self.si(QtWidgets.QStyle.SP_DialogOpenButton), t("Open Log Directory"), self)
+        log_dir_action = QAction(self.si(QtWidgets.QStyle.SP_DialogOpenButton), t("Open Log Directory"), self)
         log_dir_action.triggered.connect(self.show_log_dir)
 
-        log_action = QtWidgets.QAction(
-            self.si(QtWidgets.QStyle.SP_FileDialogDetailedView), t("View GUI Debug Logs"), self
-        )
-        log_action.triggered.connect(self.show_logs)
+        # log_action = QAction(self.si(QtWidgets.QStyle.SP_FileDialogDetailedView), t("View GUI Debug Logs"), self)
+        # log_action.triggered.connect(self.show_logs)
 
-        report_action = QtWidgets.QAction(self.si(QtWidgets.QStyle.SP_DialogHelpButton), t("Report Issue"), self)
+        report_action = QAction(self.si(QtWidgets.QStyle.SP_DialogHelpButton), t("Report Issue"), self)
         report_action.triggered.connect(self.open_issues)
 
-        version_action = QtWidgets.QAction(
+        version_action = QAction(
             self.si(QtWidgets.QStyle.SP_BrowserReload), t("Check for Newer Version of FastFlix"), self
         )
-        version_action.triggered.connect(lambda: latest_fastflix(no_new_dialog=True))
+        version_action.triggered.connect(lambda: latest_fastflix(show_new_dialog=True, app=self.app))
 
-        ffmpeg_update_action = QtWidgets.QAction(
-            self.si(QtWidgets.QStyle.SP_ArrowDown), t("Download Newest FFmpeg"), self
-        )
+        ffmpeg_update_stable_action = QAction(self.si(QtWidgets.QStyle.SP_ArrowDown), t("Download Stable FFmpeg"), self)
+        ffmpeg_update_stable_action.triggered.connect(self.download_stable_ffmpeg)
+
+        ffmpeg_update_action = QAction(self.si(QtWidgets.QStyle.SP_ArrowDown), t("Download Nightly FFmpeg"), self)
         ffmpeg_update_action.triggered.connect(self.download_ffmpeg)
 
-        clean_logs_action = QtWidgets.QAction(self.si(QtWidgets.QStyle.SP_DialogResetButton), t("Clean Old Logs"), self)
+        rigaya_update_action = QAction(self.si(QtWidgets.QStyle.SP_ArrowDown), t("Update Rigaya's Encoders"), self)
+        rigaya_update_action.triggered.connect(self.download_rigaya)
+
+        hdr10plus_download_action = QAction(self.si(QtWidgets.QStyle.SP_ArrowDown), t("Download HDR10+ Tool"), self)
+        hdr10plus_download_action.triggered.connect(self.download_hdr10plus_tool)
+
+        clean_logs_action = QAction(self.si(QtWidgets.QStyle.SP_DialogResetButton), t("Clean Old Logs"), self)
         clean_logs_action.triggered.connect(self.clean_old_logs)
 
         help_menu = menubar.addMenu(t("Help"))
         help_menu.addAction(wiki_action)
         help_menu.addSeparator()
-        help_menu.addAction(changes_action)
+
+        if changes_file.exists() or local_changes_file.exists() or local_package_changes_file.exists():
+            help_menu.addAction(changes_action)
         help_menu.addAction(report_action)
         help_menu.addAction(log_dir_action)
-        help_menu.addAction(log_action)
+        # help_menu.addAction(log_action)
         help_menu.addAction(clean_logs_action)
         help_menu.addSeparator()
         help_menu.addAction(version_action)
         if reusables.win_based:
+            help_menu.addAction(ffmpeg_update_stable_action)
             help_menu.addAction(ffmpeg_update_action)
+            help_menu.addAction(rigaya_update_action)
+            help_menu.addAction(hdr10plus_download_action)
         help_menu.addSeparator()
         help_menu.addAction(about_action)
+
+    def rebuild_menu(self):
+        self.menuBar().clear()
+        self.init_menu()
+
+    def show_history(self):
+        if hasattr(self, "history_window") and self.history_window is not None:
+            self.history_window.close()
+        self.history_window = HistoryWindow(app=self.app)
+        self.history_window.apply_settings_requested.connect(self._apply_history_entry)
+        self.history_window.show()
+
+    def _update_history_menu_state(self):
+        if self.apply_last_action is None:
+            return
+        from fastflix.models.history import load_history
+
+        has_video = self.app.fastflix.current_video is not None
+        has_history = bool(load_history(self.app.fastflix.data_path))
+        self.apply_last_action.setEnabled(has_video and has_history)
+
+    def apply_last_history(self):
+        from fastflix.models.history import load_history
+
+        entries = load_history(self.app.fastflix.data_path)
+        if not entries:
+            error_message(t("No encoding history available"))
+            return
+        self._apply_history_entry(entries[-1])
+
+    def _apply_history_entry(self, entry):
+        from fastflix.models.encode import setting_types
+
+        if not self.app.fastflix.current_video:
+            error_message(t("Please load a video first"))
+            return
+
+        # Find the settings class matching the encoder name
+        settings_class = None
+        for cls in setting_types.values():
+            if cls().name == entry.encoder_name:
+                settings_class = cls
+                break
+        if not settings_class:
+            error_message(f"{t('Encoder not available')}: {entry.encoder_name}")
+            return
+
+        # Check if encoder is available
+        if entry.encoder_name not in [e.name for e in self.app.fastflix.encoders.values()]:
+            error_message(f"{t('Encoder not available')}: {entry.encoder_name}")
+            return
+
+        try:
+            new_settings = settings_class(**entry.encoder_settings)
+            # Switch encoder first (creates panel from profile defaults)
+            self.main.widgets.convert_to.setCurrentText(entry.encoder_name)
+            # Then set our settings on the model
+            self.app.fastflix.current_video.video_settings.video_encoder_settings = new_settings
+            # Reload the panel widgets from the model settings
+            self.main.video_options.current_settings.reload()
+            self.main.page_update(build_thumbnail=False)
+        except Exception:
+            logger.exception("Failed to apply history settings")
+            error_message(t("Failed to apply settings from history"))
 
     def show_wiki(self):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl("https://github.com/cdgriffith/FastFlix/wiki"))
 
+    def show_concat(self):
+        self.concat = ConcatWindow(app=self.app, main=self.main)
+        self.concat.show()
+
     def show_about(self):
-        self.about = About()
+        self.about = About(app=self.app)
         self.about.show()
 
     def show_setting(self):
@@ -181,7 +549,14 @@ class Container(QtWidgets.QMainWindow):
         self.setting.show()
 
     def new_profile(self):
-        self.profile.show()
+        if not self.app.fastflix.current_video:
+            error_message(t("Please load in a video to configure a new profile"))
+        else:
+            self.main.page_update(build_thumbnail=False)
+            if self.profile_window:
+                self.profile_window.close()
+            self.profile_window = ProfileWindow(self.app, self.main, self)
+            self.profile_window.show()
 
     def show_profile(self):
         self.profile_details = ProfileDetails(
@@ -190,70 +565,145 @@ class Container(QtWidgets.QMainWindow):
         self.profile_details.show()
 
     def delete_profile(self):
-        self.profile.delete_current_profile()
+        if self.app.fastflix.config.selected_profile in get_preset_defaults():
+            return error_message(
+                f"{self.app.fastflix.config.selected_profile} {t('is a default profile and will not be removed')}"
+            )
+        self.main.loading_video = True
+        del self.app.fastflix.config.profiles[self.app.fastflix.config.selected_profile]
+        self.app.fastflix.config.selected_profile = "Standard Profile"
+        self.app.fastflix.config.save()
+        self.main.widgets.profile_box.clear()
+        self.main.widgets.profile_box.addItems(self.app.fastflix.config.profiles.keys())
+        self.main.loading_video = False
+        self.main.widgets.profile_box.setCurrentText("Standard Profile")
+        self.main.widgets.convert_to.setCurrentIndex(0)
 
-    def show_logs(self):
-        self.logs.show()
+    # def show_logs(self):
+    #     self.logs.show()
 
     def show_changes(self):
+        if not self.changes:
+            self.changes = Changes()
         self.changes.show()
 
     def open_issues(self):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl("https://github.com/cdgriffith/FastFlix/issues"))
 
     def show_log_dir(self):
-        OpenFolder(self, str(self.app.fastflix.log_path)).run()
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(self.app.fastflix.log_path)))
 
-    def download_ffmpeg(self):
+    def download_stable_ffmpeg(self):
+        self.download_ffmpeg(ffmpeg_version="stable")
+
+    def download_ffmpeg(self, ffmpeg_version="latest"):
+        from fastflix.widgets.status_bar import Task as SBTask
+
         ffmpeg_folder = Path(user_data_dir("FFmpeg", appauthor=False, roaming=True)) / "bin"
         ffmpeg = ffmpeg_folder / "ffmpeg.exe"
         ffprobe = ffmpeg_folder / "ffprobe.exe"
         try:
-            self.pb = ProgressBar(
-                self.app, [Task(t("Downloading FFmpeg"), latest_ffmpeg)], signal_task=True, can_cancel=True
+            self.status_bar.run_tasks(
+                [SBTask(t("Downloading FFmpeg"), grab_stable_ffmpeg if ffmpeg_version == "stable" else latest_ffmpeg)],
+                signal_task=True,
+                can_cancel=True,
+                persist_complete=True,
             )
         except FastFlixInternalException:
             pass
         except Exception as err:
-            message(f"{t('Could not download the newest FFmpeg')}: {err}")
+            self.status_bar.set_state(STATE_ERROR, f"{t('Could not download the newest FFmpeg')}: {err}")
         else:
             if not ffmpeg.exists() or not ffprobe.exists():
-                message(f"{t('Could not locate the downloaded files at')} {ffmpeg_folder}!")
+                self.status_bar.set_state(
+                    STATE_ERROR, f"{t('Could not locate the downloaded files at')} {ffmpeg_folder}!"
+                )
             else:
                 self.app.fastflix.config.ffmpeg = ffmpeg
                 self.app.fastflix.config.ffprobe = ffprobe
-        self.pb = None
+                self.status_bar.set_state(STATE_COMPLETE, t("FFmpeg downloaded successfully"))
 
-    def clean_old_logs(self):
+    def download_rigaya(self):
+        from fastflix.widgets.status_bar import Task as SBTask
+
         try:
-            self.pb = ProgressBar(self.app, [Task(t("Clean Old Logs"), clean_logs)], signal_task=True, can_cancel=False)
+            self.status_bar.run_tasks(
+                [SBTask(t("Updating Rigaya's encoders"), update_rigaya_encoders)],
+                signal_task=True,
+                can_cancel=True,
+                persist_complete=True,
+            )
         except Exception:
-            error_message(t("Could not compress old logs"), traceback=True)
-        self.pb = None
+            error_message(t("Could not update Rigaya's encoders"), traceback=True)
+        else:
+            self.status_bar.set_state(STATE_COMPLETE, t("Rigaya's encoders updated"))
 
+    def download_hdr10plus_tool(self):
+        from fastflix.widgets.status_bar import Task as SBTask
 
-class OpenFolder(QtCore.QThread):
-    def __init__(self, parent, path):
-        super().__init__(parent)
-        self.app = parent
-        self.path = str(path)
-
-    def __del__(self):
         try:
-            self.wait()
-        except BaseException:
-            pass
+            self.status_bar.run_tasks(
+                [SBTask(t("Downloading HDR10+ Tool"), download_hdr10plus_tool)],
+                signal_task=True,
+                can_cancel=True,
+                persist_complete=True,
+            )
+        except Exception:
+            error_message(t("Could not download HDR10+ tool"), traceback=True)
+        else:
+            from fastflix.models.config import find_hdr10plus_tool
 
-    def run(self):
-        try:
-            if reusables.win_based:
-                run(["explorer", self.path])
-            elif sys.platform == "darwin":
-                run(["open", self.path])
+            result = find_hdr10plus_tool()
+            if result:
+                self.app.fastflix.config.hdr10plus_parser = result
+                self.app.fastflix.config.save()
+                self.status_bar.set_state(STATE_COMPLETE, f"{t('HDR10+ tool has been downloaded to')} {result}")
             else:
-                run(["xdg-open", self.path])
-        except FileNotFoundError:
-            logger.error(f"Do not know which command to use to open: {self.path}")
+                error_message(t("Could not locate the downloaded HDR10+ tool"))
+
+    def clean_old_logs(self, show_errors=True):
+        from fastflix.widgets.status_bar import Task as SBTask
+
+        try:
+            self.status_bar.run_tasks(
+                [SBTask(t("Clean Old Logs"), clean_logs)],
+                signal_task=True,
+                can_cancel=False,
+                persist_complete=True,
+            )
+        except Exception:
+            if show_errors:
+                error_message(t("Could not compress old logs"), traceback=True)
+
+    def set_stay_top(self):
+        if self.app.fastflix.config.stay_on_top:
+            # Change to not stay on top
+            self.setWindowFlags(self.windowFlags() & ~QtCore.Qt.WindowStaysOnTopHint)
+            self.stay_on_top_action.setIcon(self.si(QtWidgets.QStyle.SP_DialogNoButton))
+        else:
+            self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
+            self.stay_on_top_action.setIcon(self.si(QtWidgets.QStyle.SP_DialogYesButton))
+        self.show()
+
+        self.app.fastflix.config.stay_on_top = not self.app.fastflix.config.stay_on_top
+        self.app.fastflix.config.save()
+
+    def open_many(self):
+        if self.app.fastflix.current_video:
+            discard = yes_no_message(
+                f"{t('There is already a video being processed')}<br>{t('Are you sure you want to discard it?')}",
+                title="Discard current video",
+            )
+            if not discard:
+                return
+        self.main.clear_current_video()
+        self.mfw = MultipleFilesWindow(app=self.app, main=self.main)
+        self.mfw.show()
+
+        # folder_name = QtWidgets.QFileDialog.getExistingDirectory(self)
+        # if not folder_name:
+        #     return
+        # self.main.open_many(paths=[x for x in Path(folder_name).glob("*") if x.name.lower().endswith(video_file_types)])
 
 
 class ProfileDetails(QtWidgets.QWidget):
@@ -261,9 +711,9 @@ class ProfileDetails(QtWidgets.QWidget):
         widget = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout()
         title = QtWidgets.QLabel(t("Encoder Settings"))
-        title.setFont(QtGui.QFont("helvetica", 9, weight=70))
+        # title.setFont(QtGui.QFont(self.app.font().family(), 9, weight=70))
         layout.addWidget(title)
-        for k, v in settings.dict().items():
+        for k, v in settings.model_dump().items():
             item_1 = QtWidgets.QLabel(" ".join(str(k).split("_")).title())
             item_2 = QtWidgets.QLabel(str(v))
             item_2.setMaximumWidth(150)
@@ -280,11 +730,15 @@ class ProfileDetails(QtWidgets.QWidget):
 
         main_section = QtWidgets.QVBoxLayout(self)
         profile_title = QtWidgets.QLabel(f"{t('Profile_window')}: {profile_name}")
-        profile_title.setFont(QtGui.QFont("helvetica", 10, weight=70))
+        # profile_title.setFont(QtGui.QFont(self.app.font().family(), 10, weight=70))
         main_section.addWidget(profile_title)
-        for k, v in profile.dict().items():
+        for k, v in profile.model_dump().items():
+            if k == "advanced_options":
+                continue
+            if k.lower().startswith("audio") or k.lower() == "profile_version":
+                continue
             if k not in setting_types.keys():
-                item_1 = QtWidgets.QLabel(" ".join(str(k).split("_")).title())
+                item_1 = QtWidgets.QLabel(t(" ".join(str(k).split("_")).title()))
                 item_2 = QtWidgets.QLabel(str(v))
                 item_2.setMaximumWidth(150)
                 inner_layout = QtWidgets.QHBoxLayout()
@@ -302,5 +756,25 @@ class ProfileDetails(QtWidgets.QWidget):
             setting = getattr(profile, setting_name)
             if setting:
                 self.layout.addWidget(self.profile_widget(setting))
+
+        splitter = QtWidgets.QWidget()
+        splitter.setMaximumWidth(1)
+        splitter.setStyleSheet("background-color: #999999")
+        self.layout.addWidget(splitter)
+
+        advanced_section = QtWidgets.QVBoxLayout(self)
+        advanced_section.addWidget(QtWidgets.QLabel(t("Advanced Options")))
+        for k, v in profile.advanced_options.model_dump().items():
+            if k.endswith("_index"):
+                continue
+            item_1 = QtWidgets.QLabel(k)
+            item_2 = QtWidgets.QLabel(str(v))
+            item_2.setMaximumWidth(150)
+            inner_layout = QtWidgets.QHBoxLayout()
+            inner_layout.addWidget(item_1)
+            inner_layout.addWidget(item_2)
+            advanced_section.addLayout(inner_layout)
+        self.layout.addLayout(advanced_section)
+
         self.setMinimumWidth(780)
         self.setLayout(self.layout)

@@ -1,13 +1,64 @@
 # -*- coding: utf-8 -*-
+
 from box import Box
-from qtpy.QtWidgets import QApplication
 
 from fastflix.application import init_encoders
+from fastflix.models.config import Config
 
-fake_app = QApplication([])
-fake_app.fastflix = Box(default_box=True)
+# from fastflix.widgets.container import Container
+
+# import pytest
+
+fake_app = Box(default_box=True)
+fake_app.fastflix.config = Config()
 
 
 def test_init_encoders():
     init_encoders(fake_app)
     assert "encoders" in fake_app.fastflix
+
+
+# def test_app(qtbot):
+#     # app = create_app(enable_scaling=False)
+#     container = Container(MagicMock())
+#     qtbot.addWidget(container)
+#     from pytestqt.qt_compat import qt_api
+#
+#     qtbot.mouseClick(container.menuBar(), qt_api.QtCore.Qt.MouseButton.LeftButton)
+#
+#     assert container.menuBar().actions()[0].text() == "File"
+#     #assert widget.greet_label.text() == "Hello!"
+
+
+# def test_get_ffmpeg_version():
+#     ffmpeg_configuration(fake_app, fake_app.fastflix.config)
+#     assert getattr(fake_app.fastflix, "ffmpeg_version")
+#     assert getattr(fake_app.fastflix, "ffmpeg_config")
+#
+#
+# def test_get_ffprobe_version():
+#     ffprobe_configuration(fake_app, fake_app.fastflix.config)
+#     assert getattr(fake_app.fastflix, "ffprobe_version")
+#
+#
+# def test_get_audio_encoders():
+#     ffmpeg_audio_encoders(fake_app, fake_app.fastflix.config)
+#     assert len(getattr(fake_app.fastflix, "audio_encoders", [])) > 0
+
+
+# Write a pytest for the Pyqt6 application defined in the fastflix/application.py file.
+# def test_application():
+#     app = create_app(enable_scaling=False)
+
+
+def test_refresh_ffmpeg_info_passes_config(monkeypatch):
+    from fastflix import application
+
+    calls = []
+    monkeypatch.setattr(application, "ffmpeg_configuration", lambda app, config, **_: calls.append(("conf", config)))
+    monkeypatch.setattr(application, "ffmpeg_audio_encoders", lambda app, config: calls.append(("audio", config)))
+    monkeypatch.setattr(application, "ffmpeg_video_encoders", lambda app, config: calls.append(("video", config)))
+    monkeypatch.setattr(application, "init_encoders", lambda app, **_: calls.append(("init", None)))
+    application._refresh_ffmpeg_info(fake_app)
+    assert [c[0] for c in calls] == ["conf", "audio", "video", "init"]
+    assert calls[0][1] is fake_app.fastflix.config

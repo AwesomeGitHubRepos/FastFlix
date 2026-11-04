@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 import logging
-import re
 import secrets
+import shlex
 
 import reusables
 
+from fastflix.encoders.common.hdr_metadata import is_hdr_bit_depth
 from fastflix.encoders.common.helpers import Command, generate_all, generate_color_details, null
 from fastflix.models.encode import SVTAV1Settings
 from fastflix.models.fastflix import FastFlix
@@ -17,40 +18,149 @@ logger = logging.getLogger("fastflix")
 @reusables.log_exception("fastflix", show_traceback=True)
 def build(fastflix: FastFlix):
     settings: SVTAV1Settings = fastflix.current_video.video_settings.video_encoder_settings
-    beginning, ending = generate_all(fastflix, "libsvtav1")
+    beginning, ending, output_fps = generate_all(fastflix, "libsvtav1")
 
-    beginning += (
-        f"-strict experimental "
-        f"-preset {settings.speed} "
-        f"-tile_columns {settings.tile_columns} "
-        f"-tile_rows {settings.tile_rows} "
-        f"-tier {settings.tier} "
-        f"{generate_color_details(fastflix)} "
+    beginning.extend(["-preset", str(settings.speed)])
+    beginning.extend(generate_color_details(fastflix))
+
+    svtav1_params = settings.svtav1_params.copy()
+
+    if settings.tune != "1":
+        svtav1_params.append(f"tune={settings.tune}")
+    # Film grain synthesis is not compatible with lossless mode
+    if settings.film_grain and not settings.lossless:
+        svtav1_params.append(f"film-grain={settings.film_grain}")
+        if settings.film_grain_denoise:
+            svtav1_params.append("film-grain-denoise=1")
+    if settings.sharpness != "0":
+        svtav1_params.append(f"sharpness={settings.sharpness}")
+    if settings.fast_decode != "0":
+        svtav1_params.append(f"fast-decode={settings.fast_decode}")
+    if settings.enable_variance_boost:
+        svtav1_params.append("enable-variance-boost=1")
+        if settings.variance_boost_strength != "2":
+            svtav1_params.append(f"variance-boost-strength={settings.variance_boost_strength}")
+        if settings.variance_octile != "5":
+            svtav1_params.append(f"variance-octile={settings.variance_octile}")
+    if settings.enable_tf != "1":
+        svtav1_params.append(f"enable-tf={settings.enable_tf}")
+    if settings.startup_mg_size != "0":
+        svtav1_params.append(f"startup-mg-size={settings.startup_mg_size}")
+    if settings.enable_qm:
+        svtav1_params.append("enable-qm=1")
+        if settings.qm_min != "8":
+            svtav1_params.append(f"qm-min={settings.qm_min}")
+        if settings.qm_max != "15":
+            svtav1_params.append(f"qm-max={settings.qm_max}")
+
+    svtav1_params.extend(
+        [
+            f"tile-columns={settings.tile_columns}",
+            f"tile-rows={settings.tile_rows}",
+            f"scd={1 if settings.scene_detection else 0}",
+        ]
     )
 
+    if not fastflix.current_video.video_settings.remove_hdr:
+        if (
+            fastflix.current_video.video_settings.color_primaries == "bt2020"
+            or fastflix.current_video.color_primaries == "bt2020"
+        ):
+            svtav1_params.append("color-primaries=9")
+
+        if (
+            fastflix.current_video.video_settings.color_transfer == "smpte2084"
+            or fastflix.current_video.color_transfer == "smpte2084"
+        ):
+            svtav1_params.append("transfer-characteristics=16")
+
+        if (
+            fastflix.current_video.video_settings.color_space
+            and "bt2020" in fastflix.current_video.video_settings.color_space
+        ) or (fastflix.current_video.color_space and "bt2020" in fastflix.current_video.color_space):
+            svtav1_params.append("matrix-coefficients=9")
+
+        enable_hdr = False
+        if is_hdr_bit_depth(settings.pix_fmt):
+
+            def convert_me(two_numbers, conversion_rate=50_000) -> str:
+                try:
+                    num_one, num_two = map(float, two_numbers.strip("()").split(","))
+                    return f"{num_one / conversion_rate:0.4f},{num_two / conversion_rate:0.4f}"
+                except ValueError:
+                    # If the values are already in the correct format, just return them
+                    return two_numbers.strip("()")
+
+            if fastflix.current_video.master_display:
+                svtav1_params.append(
+                    "mastering-display="
+                    f"G({convert_me(fastflix.current_video.master_display.green)})"
+                    f"B({convert_me(fastflix.current_video.master_display.blue)})"
+                    f"R({convert_me(fastflix.current_video.master_display.red)})"
+                    f"WP({convert_me(fastflix.current_video.master_display.white)})"
+                    f"L({convert_me(fastflix.current_video.master_display.luminance, 10_000)})"
+                )
+                enable_hdr = True
+
+            if fastflix.current_video.cll:
+                svtav1_params.append(f"content-light={fastflix.current_video.cll}")
+                enable_hdr = True
+
+            if enable_hdr:
+                svtav1_params.append("enable-hdr=1")
+
+    if settings.lossless:
+        svtav1_params.append("lossless=1")
+
+    if svtav1_params:
+        beginning.extend(["-svtav1-params", ":".join(svtav1_params)])
+
     if not settings.single_pass:
-        pass_log_file = fastflix.current_video.work_path / f"pass_log_file_{secrets.token_hex(10)}"
-        beginning += f'-passlogfile "{pass_log_file}" '
+        pass_log_file = f"pass_log_file_{secrets.token_hex(10)}"
+        beginning.extend(["-passlogfile", pass_log_file])
 
     pass_type = "bitrate" if settings.bitrate else "QP"
 
-    if settings.single_pass:
+    extra = shlex.split(settings.extra) if settings.extra else []
+    extra_both = shlex.split(settings.extra) if settings.extra and settings.extra_both_passes else []
+
+    if settings.lossless:
+        # Lossless mode — no rate control needed
+        command = beginning + extra + ending
+        return [Command(command=command, name="Single pass lossless", exe="ffmpeg")]
+
+    # SVT-AV1 does not support CRF with multi-pass
+    if settings.single_pass or (not settings.bitrate and settings.qp_mode == "crf"):
         if settings.bitrate:
-            command_1 = f"{beginning} -b:v {settings.bitrate} -rc 1 {settings.extra} {ending}"
+            command_1 = beginning + ["-b:v", settings.bitrate] + extra + ending
 
         elif settings.qp is not None:
-            command_1 = f"{beginning} -qp {settings.qp} -rc 0 {settings.extra} {ending}"
+            command_1 = beginning + [f"-{settings.qp_mode}", str(settings.qp)] + extra + ending
         else:
             return []
         return [Command(command=command_1, name=f"{pass_type}", exe="ffmpeg")]
     else:
         if settings.bitrate:
-            command_1 = f"{beginning} -b:v {settings.bitrate} -rc 1 -pass 1 {settings.extra if settings.extra_both_passes else ''} -an -f matroska {null}"
-            command_2 = f"{beginning} -b:v {settings.bitrate} -rc 1 -pass 2 {settings.extra} {ending}"
+            command_1 = (
+                beginning
+                + ["-b:v", settings.bitrate, "-pass", "1"]
+                + extra_both
+                + ["-an"]
+                + output_fps
+                + ["-f", "matroska", null]
+            )
+            command_2 = beginning + ["-b:v", settings.bitrate, "-pass", "2"] + extra + ending
 
         elif settings.qp is not None:
-            command_1 = f"{beginning} -qp {settings.qp} -rc 0 -pass 1 {settings.extra if settings.extra_both_passes else ''} -an -f matroska {null}"
-            command_2 = f"{beginning} -qp {settings.qp} -rc 0 -pass 2 {settings.extra} {ending}"
+            command_1 = (
+                beginning
+                + [f"-{settings.qp_mode}", str(settings.qp), "-pass", "1"]
+                + extra_both
+                + ["-an"]
+                + output_fps
+                + ["-f", "matroska", null]
+            )
+            command_2 = beginning + [f"-{settings.qp_mode}", str(settings.qp), "-pass", "2"] + extra + ending
         else:
             return []
         return [
